@@ -1,0 +1,21 @@
+# systemd unit: keeps the tracker running and restarts it after crashes or reboots.
+#   sudo cp deploy/project-tracker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now project-tracker
+#   journalctl -u project-tracker -f        # view logs
+# Adjust User and the paths if the app lives somewhere other than /opt/project-tracker.
+
+[Unit]
+Description=Project Status, AMC & Domain Tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tracker
+WorkingDirectory=/opt/project-tracker
+ExecStart=/usr/bin/python3 server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

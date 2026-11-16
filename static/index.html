@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Status Tracker</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>Project Status, AMC &amp; Domain Tracker</h1>
+    <p class="sub" id="syncInfo">Loading…</p>
+  </div>
+  <div class="top-actions">
+    <span class="user-chip" id="userChip" hidden></span>
+    <button class="btn ghost" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <button class="btn primary" id="syncBtn">Sync from CRM</button>
+    <button class="btn ghost" id="logoutBtn" hidden>Sign out</button>
+  </div>
+</header>
+
+<main>
+  <section class="filters" aria-label="Filters">
+    <label>Month
+      <select id="fMonth"><option value="">All months</option></select>
+    </label>
+    <label>Project manager
+      <select id="fPm"><option value="">All PMs</option></select>
+    </label>
+    <label class="grow">Search
+      <input id="fSearch" type="search" placeholder="Project, client, domain…">
+    </label>
+    <button class="btn ghost small" id="clearFilters">Clear filters</button>
+  </section>
+
+  <section class="cards" id="cards" aria-label="Summary"></section>
+
+  <section class="panel" id="trendPanel">
+    <div class="panel-head">
+      <h2>Projects by report month</h2>
+      <div class="legend" id="trendLegend"></div>
+    </div>
+    <div class="trend" id="trend"></div>
+    <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="projects" class="active">Projects</button>
+    <button role="tab" data-tab="amc">AMC &amp; Renewals</button>
+    <button role="tab" data-tab="domains">Domains</button>
+    <button role="tab" data-tab="activity">Activity</button>
+    <button role="tab" data-tab="quality">Data quality</button>
+    <button role="tab" data-tab="settings">Sync &amp; settings</button>
+  </nav>
+
+  <section class="panel tabpanel" id="tab-projects">
+    <div class="panel-head">
+      <div class="chips" id="categoryChips"></div>
+      <button class="btn ghost small" data-export="projects">Export CSV</button>
+    </div>
+    <div class="table-wrap"><table id="projectsTable"></table></div>
+  </section>
+
+  <section class="panel tabpanel" id="tab-amc" hidden>
+    <div class="panel-head">
+      <div class="chips" id="amcChips"></div>
+      <button class="btn ghost small" data-export="amc">Export CSV</button>
+    </div>
+    <p class="note" id="amcRule"></p>
+    <div class="table-wrap"><table id="amcTable"></table></div>
+  </section>
+
+  <section class="panel tabpanel" id="tab-domains" hidden>
+    <div class="panel-head">
+      <div class="chips" id="domainChips"></div>
+      <button class="btn ghost small" data-export="domains">Export CSV</button>
+    </div>
+    <div class="table-wrap"><table id="domainTable"></table></div>
+  </section>
+
+  <section class="panel tabpanel" id="tab-activity" hidden>
+    <div class="panel-head">
+      <p class="note" style="margin:0">Every change saved in this portal: who made it, when, and the old and new value. CRM syncs are listed under <i>Sync &amp; settings</i>.</p>
+      <button class="btn ghost small" data-export="activity">Export CSV</button>
+    </div>
+    <div class="table-wrap"><table id="activityTable"></table></div>
+  </section>
+
+  <section class="panel tabpanel" id="tab-quality" hidden>
+    <p class="note">These fields are blank in the CRM. They are shown as missing, not filled in with guesses. Fix them in the CRM and sync again.</p>
+    <div class="quality-grid" id="qualityGrid"></div>
+    <div class="table-wrap"><table id="qualityTable"></table></div>
+  </section>
+
+  <section class="panel tabpanel" id="tab-settings" hidden>
+    <div class="settings-grid">
+      <form id="syncForm" class="card-form">
+        <h3>Sync specific months</h3>
+        <p class="note">Paste one or more CRM monthly-report links (one per line), or YYYY-MM months. Leave empty to sync every month the CRM lists.</p>
+        <textarea id="syncInput" rows="5" placeholder="https://crm.webel.io/tracker/public/monthly-report?month=2025-09&pm=&status=&website="></textarea>
+        <button class="btn primary" type="submit">Sync</button>
+        <pre class="log" id="syncLog" hidden></pre>
+      </form>
+      <form id="settingsForm" class="card-form">
+        <h3>Rules</h3>
+        <label>Warn about domains expiring within (days)
+          <input type="number" name="domain_warning_days" min="1" max="365">
+        </label>
+        <label>Mark an open project with no deadline as Delayed this many days after its report month ends
+          <input type="number" name="no_deadline_grace_days" min="0" max="3650">
+        </label>
+        <fieldset>
+          <legend>CRM statuses that count as Delayed</legend>
+          <div id="delayedStatuses"></div>
+        </fieldset>
+        <label>Default AMC amount (incl. GST)
+          <input type="number" name="amc_default_amount" min="0" step="0.01">
+        </label>
+        <label>AMC is due this many months after the project's start month
+          <input type="number" name="amc_due_months" min="1" max="120">
+        </label>
+        <label>Grace months after the due date before a project is automatically under AMC
+          <input type="number" name="amc_grace_months" min="0" max="60">
+        </label>
+        <label>Currency symbol
+          <input type="text" name="currency" maxlength="5">
+        </label>
+        <button class="btn primary" type="submit">Save rules</button>
+      </form>
+    </div>
+    <h3>Sync history</h3>
+    <div class="table-wrap"><table id="syncLogTable"></table></div>
+  </section>
+</main>
+
+<div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+<aside class="drawer" id="drawer" aria-hidden="true" aria-labelledby="drawerTitle">
+  <div class="drawer-head">
+    <div>
+      <h2 id="drawerTitle"></h2>
+      <p class="sub" id="drawerSub"></p>
+    </div>
+    <button class="btn ghost" id="drawerClose" aria-label="Close">✕</button>
+  </div>
+  <div class="drawer-body">
+    <h3>From CRM <span class="tag">read-only</span></h3>
+    <dl class="crm-fields" id="crmFields"></dl>
+    <div id="crmHistory"></div>
+
+    <form id="trackForm">
+      <h3>Manual tracking <span class="tag">edited here · every change is logged</span></h3>
+      <p class="note" id="readonlyNote" hidden>Your account can view this dashboard but not edit it.</p>
+      <fieldset>
+        <legend>AMC</legend>
+        <p class="note" id="amcSchedule"></p>
+        <div class="form-grid">
+          <label>AMC applies
+            <select name="amc.applies">
+              <option value="">Automatic (website projects)</option>
+              <option value="yes">Yes, always</option>
+              <option value="no">No AMC for this project</option>
+            </select>
+          </label>
+          <label>Pitch / payment status
+            <select name="amc.status">
+              <option value="">— not recorded —</option>
+              <option value="not_pitched">Not pitched</option>
+              <option value="pitched">Pitched (awaiting)</option>
+              <option value="received">Received</option>
+              <option value="declined">Declined</option>
+            </select>
+          </label>
+          <label>Pitched on <input type="date" name="amc.pitched_date"></label>
+          <label>AMC amount (incl. GST) <input type="number" step="0.01" min="0" name="amc.quoted_amount"></label>
+          <label>Amount received <input type="number" step="0.01" min="0" name="amc.received_amount"></label>
+          <label>Received on <input type="date" name="amc.received_date"></label>
+          <label>AMC period ends <input type="date" name="amc.period_end"></label>
+        </div>
+        <label>Notes <textarea name="amc.notes" rows="2"></textarea></label>
+      </fieldset>
+      <fieldset>
+        <legend>Website AMC renewal</legend>
+        <div class="form-grid">
+          <label>Status
+            <select name="renewal.status">
+              <option value="">— not recorded —</option>
+              <option value="not_due">Not due yet</option>
+              <option value="pending">Pending (due, not renewed)</option>
+              <option value="renewed">Renewed by client</option>
+              <option value="lost">Not renewing</option>
+            </select>
+          </label>
+          <label>Renewal due <input type="date" name="renewal.due_date"></label>
+          <label>Renewed on <input type="date" name="renewal.renewed_date"></label>
+          <label>Renewal amount <input type="number" step="0.01" min="0" name="renewal.amount"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Domain</legend>
+        <div class="form-grid">
+          <label>Domain name <input type="text" name="domain.name" placeholder="example.com"></label>
+          <label>Domain ownership
+            <select name="domain.ownership">
+              <option value="webelio">With Webelio</option>
+              <option value="client">With client</option>
+            </select>
+          </label>
+          <label>Registrar <input type="text" name="domain.registrar"></label>
+          <label>Expiry date <input type="date" name="domain.expiry_date"></label>
+          <label class="check"><input type="checkbox" name="domain.auto_renew"> Auto-renew on</label>
+        </div>
+        <label>Notes <textarea name="domain.notes" rows="2"></textarea></label>
+      </fieldset>
+      <div class="form-actions">
+        <span class="sub" id="trackMeta"></span>
+        <button class="btn primary" type="submit">Save</button>
+      </div>
+    </form>
+    <div id="projectChanges"></div>
+  </div>
+</aside>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

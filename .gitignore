@@ -1,0 +1,21 @@
+# Secrets: Google client secret etc. (.env.example is kept as the template)
+.env
+.env.*
+!.env.example
+
+# Data: the database holds client and payment details. Back it up, don't commit it.
+data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
