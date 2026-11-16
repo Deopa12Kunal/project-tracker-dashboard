@@ -1,45 +1,73 @@
 # Project Status, AMC & Domain Tracker
 
-A local dashboard for project status (from the Webelio CRM), AMC pitches and payments, website AMC renewals, and domain expiry.
+An internal dashboard for project status (from the Webelio CRM), AMC pitches, payments and reminders, website AMC renewals, and domain expiry.
 
 Needs only Python 3.10 or newer. No packages to install.
 
 ## Run on your own computer
 
 ```
-python server.py                      # http://127.0.0.1:8765
-python server.py --auto-sync-hours 6  # also re-sync from the CRM every 6 hours
+python manage.py add-user admin --name "Your Name" --role admin   # once: create the first admin
+python server.py                                                   # http://127.0.0.1:8765
+python server.py --auto-sync-hours 6   # also re-sync from the CRM every 6 hours
 ```
 
 On Windows you can also double-click `start.bat`. It opens the browser and auto-syncs every 6 hours.
 
-Without Google sign-in configured, the dashboard runs in **local mode**: no login, and it only answers requests made on the same machine.
+## Logins
+
+Everyone signs in with a **login ID and password created by an admin**. There is no public sign-up.
+
+| Role | Can do |
+|---|---|
+| Admin | Everything an editor can, plus add users, reset passwords, change roles and deactivate accounts (*Users* tab) |
+| Editor | Update AMC, renewal and domain records, send WhatsApp reminders, sync from the CRM, change the rules |
+| Viewer | Look only |
+
+- **Create the first admin** on the server with `python manage.py add-user <login-id> --name "Full Name" --role admin`. After that, admins add everyone else in the *Users* tab.
+- **Forgotten password:** an admin resets it in the *Users* tab, or on the server with `python manage.py reset-password <login-id>`.
+- **Change your own password:** click your name at the top right.
+- **Security:** passwords are stored only as salted PBKDF2 hashes, never in plain text. After 5 wrong passwords, that login ID is locked for 15 minutes. A deactivated account is signed out at once and can't sign in.
+- `python manage.py list-users` shows all accounts.
+
+## WhatsApp AMC reminders
+
+In the *AMC & Renewals* tab, or in a project's panel, click **WhatsApp**:
+
+1. WhatsApp (the app, or WhatsApp Web) opens with the reminder already written: the project, amount (incl. GST) and due date.
+2. The project name is copied, so you can paste it into WhatsApp's search to find the client's group. Choose the group and send.
+3. Back in the dashboard, answer **"Did you send the reminder?"**. **Yes** marks the client as **Informed** with today's date and your name, and your colleagues see it.
+
+WhatsApp doesn't tell other apps whether a message was sent, which is why the dashboard asks. To correct the date or clear it, edit *Client informed on* in the project's panel. Change the message wording under *Sync & settings* → *WhatsApp AMC reminder message*.
+
+The *Still to inform* filter and the *AMC reminders sent* card show which due or overdue AMC clients haven't been informed yet.
+
+## Working together
+
+- **Who changed what:** the *Activity* tab lists every change, with who made it, when, and the old and new value. Each project's panel shows its own history, and the AMC list has a *Last update* column.
+- **Live updates:** an open dashboard checks for colleagues' changes every 30 seconds and refreshes itself. It waits if you have a project open, so it never interrupts you.
+- **No silent overwrites:** if two people edit the same project at the same time, the second save is stopped with a message saying who changed it. That person then reopens the project and redoes their change.
 
 ## Deploy on the company server
 
-The app runs as a small Python service behind nginx (HTTPS). Colleagues sign in with their @webel.io Google account. The steps below assume a Linux server with Python 3.10+, nginx and systemd.
+The app runs as a small Python service behind nginx (HTTPS). The steps below assume a Linux server with Python 3.10+, nginx and systemd.
 
-**1. Create the Google sign-in client** (once, in the Webelio Google Cloud project):
-1. Go to Google Cloud Console → *APIs & Services* → *OAuth consent screen*. Choose **Internal**, which limits sign-in to your Workspace.
-2. Go to *Credentials* → *Create credentials* → *OAuth client ID* → *Web application*.
-3. Under *Authorized redirect URIs*, add `https://<your tracker domain>/auth/callback`.
-4. Copy the client ID and client secret.
+**1. Copy the app to the server**, for example to `/opt/project-tracker`, owned by a `tracker` user. Copy `data/tracker.db` along with it, so the existing data and user accounts come too. If you leave it out, the first start imports from `data/crm_store.json` and `data/tracking.json` if they're present, or else syncs from the CRM.
 
-**2. Copy the app to the server**, for example to `/opt/project-tracker`, owned by a `tracker` user. Copy `data/tracker.db` along with it so the existing data comes too. If you leave it out, the first start imports from `data/crm_store.json` and `data/tracking.json` if they're present, or else syncs from the CRM.
+**2. Configure it:** `cp .env.example .env`, then set `PUBLIC_URL` to the HTTPS address.
 
-**3. Configure it:** `cp .env.example .env`, then fill in `PUBLIC_URL`, `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Make the file readable only by the service user: `chmod 600 .env`.
+**3. Create the first admin** (skip this if you copied `tracker.db`, which already has your accounts):
+`sudo -u tracker python3 manage.py add-user admin --name "Your Name" --role admin`
 
 **4. Run it as a service:** see `deploy/project-tracker.service`.
 
-**5. Put nginx with HTTPS in front:** see `deploy/nginx.conf`.
+**5. Put nginx with HTTPS in front:** see `deploy/nginx.conf`. HTTPS matters here, because otherwise passwords would travel over the network unencrypted.
 
 **6. Back up the database daily**, for example with this cron job for the `tracker` user (keeps 30 days):
 ```
-0 2 * * * cd /opt/project-tracker && python3 db.py backup backups/tracker-$(date +\%F).db && find backups -name 'tracker-*.db' -mtime +30 -delete
+0 2 * * * cd /opt/project-tracker && python3 manage.py backup backups/tracker-$(date +\%F).db && find backups -name 'tracker-*.db' -mtime +30 -delete
 ```
-Create the `backups` folder first. `db.py backup` is safe to run while the server is running. To restore, stop the service, copy a backup over `data/tracker.db`, and start it again.
-
-**Access:** anyone with an @webel.io account can sign in and edit. To limit this, list people in `ALLOWED_EMAILS`. To give someone view-only access, list them in `READONLY_EMAILS`. Restart the service after changing `.env`.
+Create the `backups` folder first. The backup command is safe to run while the server is running. To restore, stop the service, copy a backup over `data/tracker.db`, and start it again.
 
 ## Where the data is stored
 
@@ -48,11 +76,11 @@ Everything lives in one SQLite database, `data/tracker.db`.
 | Data | Source | Who writes it |
 |---|---|---|
 | Projects, status, PM, progress, deadline, invoiced/paid/due | CRM public monthly report: `https://crm.webel.io/tracker/public/monthly-report?month=YYYY-MM` | The CRM sync only. Read-only in the dashboard. |
-| AMC, website renewal, domain | Entered in the dashboard (click any project) | Signed-in editors |
-| Change log | Every save in the dashboard | Recorded automatically: who, when, field, old → new value |
+| AMC, website renewal, domain, client informed | Entered in the dashboard (click any project) | Editors and admins |
+| Change log | Every save in the dashboard, plus user-account changes | Recorded automatically: who, when, field, old → new value |
+| User accounts | *Users* tab or `manage.py` | Admins |
 
-- **Change history.** The *Activity* tab lists every change across all projects. Each project's panel shows its own history and who last updated it. CRM syncs are listed under *Sync & settings*, with who started them.
-- **Progress and status come from the CRM.** Update them in the CRM, then sync. The dashboard never writes back to the CRM.
+- **Progress and status come from the CRM.** Update them in the CRM, then sync. The dashboard never writes back to the CRM. CRM syncs are listed under *Sync & settings*, with who started them.
 
 - **Sync.** "Sync from CRM" reads the month list from the CRM page and fetches every month. To sync only certain months, paste their links under *Sync & settings*, or run `python crm_sync.py 2025-09 2025-10`.
 - **No duplicates.** Records are keyed by the CRM project ID taken from the project link. Syncing a month again updates that month's snapshot and doesn't add new rows.

@@ -1,103 +1,107 @@
 """
-Google Workspace sign-in (OAuth 2.0 authorization-code flow), standard library only.
+Login ID + password sign-in for internal users (accounts are created by an admin).
 
-The ID token is received directly from Google's token endpoint over HTTPS in
-exchange for the one-time code, so its signature check can be skipped (Google's
-OpenID Connect docs allow this). Its claims are still validated: issuer,
-audience, expiry, verified email and Workspace domain.
+Passwords are never stored: only a salted PBKDF2-SHA256 hash (600,000 rounds).
+Repeated wrong passwords lock that login ID (and the address it comes from) for a while.
 """
 from __future__ import annotations
 
-import base64
-import json
+import hashlib
+import hmac
+import re
+import secrets
+import threading
 import time
-import urllib.parse
-import urllib.request
 
-import config
+ITERATIONS = 600_000
+USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
+ROLES = ("admin", "editor", "viewer")
+ROLE_LEVEL = {"viewer": 0, "editor": 1, "admin": 2}
+MIN_PASSWORD = 8
 
-AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
-TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
-ISSUERS = {"https://accounts.google.com", "accounts.google.com"}
-
-
-class AuthError(Exception):
-    """`code` is shown to the user on the login page (see static/login.html)."""
-
-    def __init__(self, code: str, detail: str = ""):
-        super().__init__(f"{code}: {detail}" if detail else code)
-        self.code = code
+MAX_FAILS_PER_USER = 5
+MAX_FAILS_PER_IP = 20
+LOCK_SECONDS = 15 * 60
 
 
-def redirect_uri() -> str:
-    return config.PUBLIC_URL + "/auth/callback"
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ITERATIONS)
+    return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${dk.hex()}"
 
 
-def login_url(state: str) -> str:
-    return AUTH_ENDPOINT + "?" + urllib.parse.urlencode({
-        "client_id": config.GOOGLE_CLIENT_ID,
-        "redirect_uri": redirect_uri(),
-        "response_type": "code",
-        "scope": "openid email profile",
-        "state": state,
-        "hd": config.ALLOWED_DOMAIN,       # hint: show only company accounts
-        "prompt": "select_account",
-    })
-
-
-def _jwt_claims(token: str) -> dict:
+def verify_password(password: str, stored: str) -> bool:
     try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception as e:
-        raise AuthError("google", f"unreadable ID token ({e})")
+        algo, iters, salt, digest = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(iters))
+        return hmac.compare_digest(dk.hex(), digest)
+    except (ValueError, TypeError):
+        return False
 
 
-def exchange_code(code: str) -> dict:
-    """Swap the one-time code for the user's verified identity claims."""
-    data = urllib.parse.urlencode({
-        "code": code,
-        "client_id": config.GOOGLE_CLIENT_ID,
-        "client_secret": config.GOOGLE_CLIENT_SECRET,
-        "redirect_uri": redirect_uri(),
-        "grant_type": "authorization_code",
-    }).encode()
-    req = urllib.request.Request(TOKEN_ENDPOINT, data=data,
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            tokens = json.load(resp)
-    except Exception as e:
-        raise AuthError("google", f"token exchange failed ({e})")
-    if not tokens.get("id_token"):
-        raise AuthError("google", "no ID token in Google's response")
-    claims = _jwt_claims(tokens["id_token"])
-    if claims.get("iss") not in ISSUERS:
-        raise AuthError("google", "wrong issuer")
-    if claims.get("aud") != config.GOOGLE_CLIENT_ID:
-        raise AuthError("google", "token is for a different app")
-    if float(claims.get("exp", 0)) < time.time():
-        raise AuthError("google", "token expired")
-    if not claims.get("email") or not claims.get("email_verified"):
-        raise AuthError("google", "email not verified")
-    claims["email"] = claims["email"].strip().lower()
-    if (claims.get("hd") or "").lower() != config.ALLOWED_DOMAIN:
-        raise AuthError("domain")
-    err = access_error(claims["email"])
-    if err:
-        raise AuthError(err)
-    return claims
+# Used when the login ID doesn't exist, so a wrong ID takes as long as a wrong password.
+_DUMMY_HASH = f"pbkdf2_sha256${ITERATIONS}${'0' * 32}${'0' * 64}"
 
 
-def access_error(email: str) -> str | None:
-    """Checked at sign-in and on every request, so removing someone takes effect at once."""
-    if not email.endswith("@" + config.ALLOWED_DOMAIN):
-        return "domain"
-    if config.ALLOWED_EMAILS and email not in config.ALLOWED_EMAILS:
-        return "notallowed"
-    return None
+def check_username(username: str) -> str:
+    username = (username or "").strip().lower()
+    if not USERNAME_RE.match(username):
+        raise ValueError("Login ID must be 3–32 characters: lowercase letters, numbers, dot, dash or underscore, "
+                         "starting with a letter or number")
+    return username
 
 
-def role_for(email: str) -> str:
-    return "viewer" if email in config.READONLY_EMAILS else "editor"
+def check_password(password: str) -> str:
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD} characters")
+    if len(password) > 200:
+        raise ValueError("Password is too long")
+    return password
+
+
+def check_role(role: str) -> str:
+    if role not in ROLES:
+        raise ValueError("Role must be admin, editor or viewer")
+    return role
+
+
+class Throttle:
+    """Remembers recent failed logins in memory (cleared when the server restarts)."""
+
+    def __init__(self):
+        self._fails: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _recent(self, key: str) -> list[float]:
+        cutoff = time.time() - LOCK_SECONDS
+        fails = [t for t in self._fails.get(key, []) if t > cutoff]
+        if fails:
+            self._fails[key] = fails
+        else:
+            self._fails.pop(key, None)
+        return fails
+
+    def locked(self, username: str, ip: str) -> bool:
+        with self._lock:
+            return (len(self._recent("u:" + username)) >= MAX_FAILS_PER_USER
+                    or len(self._recent("ip:" + ip)) >= MAX_FAILS_PER_IP)
+
+    def fail(self, username: str, ip: str) -> None:
+        with self._lock:
+            for key in ("u:" + username, "ip:" + ip):
+                self._fails.setdefault(key, []).append(time.time())
+
+    def clear(self, username: str) -> None:
+        with self._lock:
+            self._fails.pop("u:" + username, None)
+
+
+throttle = Throttle()
+
+
+def authenticate(user: dict | None, password: str) -> bool:
+    """`user` is the account row (with password_hash) or None if the login ID is unknown."""
+    ok = verify_password(password or "", user["password_hash"] if user else _DUMMY_HASH)
+    return bool(ok and user and user["active"])

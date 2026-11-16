@@ -9,22 +9,37 @@
 <body class="login-page">
 <main class="login-box">
   <h1>Project Status, AMC &amp; Domain Tracker</h1>
-  <p class="sub">Webelio internal dashboard. Sign in with your company Google account.</p>
-  <p class="login-error" id="err" role="alert" hidden></p>
-  <a class="btn primary login-btn" href="/auth/login">Sign in with Google</a>
-  <p class="note">Only @webel.io accounts can sign in.</p>
+  <p class="sub">Webelio internal dashboard</p>
+  <form id="loginForm" class="login-form">
+    <label>Login ID
+      <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+    </label>
+    <label>Password
+      <input name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <p class="login-error" id="err" role="alert" hidden></p>
+    <button class="btn primary login-btn" type="submit">Sign in</button>
+  </form>
+  <p class="note">No account, or forgot your password? Ask a dashboard admin.</p>
 </main>
 <script>
-  const msgs = {
-    domain: "That Google account isn't a company account. Sign in with your @webel.io address.",
-    notallowed: "Your account hasn't been given access to this dashboard. Ask the admin to add you.",
-    state: "The sign-in took too long or was opened in another tab. Please try again.",
-    cancelled: "Sign-in was cancelled.",
-    google: "Google sign-in failed. Please try again, or contact the admin if it keeps happening.",
-  };
-  const code = new URLSearchParams(location.search).get("error");
-  if (code) { const el = document.getElementById("err"); el.textContent = msgs[code] || msgs.google; el.hidden = false; }
   try { const th = localStorage.getItem("ptd.theme"); if (th) document.documentElement.dataset.theme = th; } catch {}
+  const form = document.getElementById("loginForm"), err = document.getElementById("err");
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector("button");
+    btn.disabled = true; btn.textContent = "Signing in…"; err.hidden = true;
+    try {
+      const res = await fetch("/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: form.username.value.trim(), password: form.password.value }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Sign-in failed");
+      location.href = "/";
+    } catch (ex) {
+      err.textContent = ex.message; err.hidden = false;
+      form.password.value = ""; form.password.focus();
+    } finally { btn.disabled = false; btn.textContent = "Sign in"; }
+  };
 </script>
 </body>
 </html>

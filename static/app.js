@@ -23,7 +23,7 @@ const FIELD_LABEL = { name: "Project name", client: "Client", pm: "Project manag
 const CHANGE_FIELD = {
   "amc.applies": "AMC applies", "amc.status": "AMC pitch / payment status", "amc.pitched_date": "AMC pitched on",
   "amc.quoted_amount": "AMC amount", "amc.received_amount": "AMC amount received", "amc.received_date": "AMC received on",
-  "amc.period_end": "AMC period ends", "amc.notes": "AMC notes",
+  "amc.period_end": "AMC period ends", "amc.notes": "AMC notes", "amc.informed_date": "Client informed (AMC reminder)",
   "renewal.status": "Renewal status", "renewal.due_date": "Renewal due", "renewal.renewed_date": "Renewed on",
   "renewal.amount": "Renewal amount", "renewal.notes": "Renewal notes",
   "domain.name": "Domain name", "domain.ownership": "Domain ownership", "domain.registrar": "Domain registrar",
@@ -123,7 +123,57 @@ function amcInfo(id) {
   }
   const why = a.applies === "yes" ? "Set to Yes manually" : a.applies === "no" ? "Set to No manually"
     : cancelled ? "Cancelled in CRM" : isWeb ? "Website project" : "Not a website project (no website assignee in CRM)";
-  return { applies, isWeb, start, dueDate, underDate, periodEnd, amount, stage, why };
+  const informed = a.informed_date || null;
+  // Client should get a reminder: AMC is due or overdue (unpaid) and nobody has informed them yet.
+  const toInform = applies && (stage === "due" || stage === "under") && !informed;
+  return { applies, isWeb, start, dueDate, underDate, periodEnd, amount, stage, why, informed, toInform };
+}
+function informedPill(info) {
+  if (!info.applies) return "";
+  if (info.informed) return statusPill("good", "✓", `Informed ${fmtDate(info.informed)}`);
+  if (info.toInform) return statusPill("warning", "!", "Not informed yet");
+  return '<span class="meta">—</span>';
+}
+
+/* WhatsApp reminder. WhatsApp's share link opens the app (or WhatsApp Web) with the
+ * message filled in; the person picks the client's group and sends it. WhatsApp can't
+ * tell us whether it was sent, so the dashboard asks afterwards and records the answer. */
+function reminderFields(id) {
+  const p = state.crm.projects[id], t = state.tracking.projects[id] || {}, ai = amcInfo(id);
+  const due = ai.stage === "paid" ? (t.renewal?.due_date || ai.periodEnd) : ai.dueDate;
+  return { project: p.latest.name || "", client: p.latest.client || p.latest.name || "",
+    amount: fmtMoney(ai.amount), due_date: fmtDate(due) };
+}
+function reminderText(id) {
+  const f = reminderFields(id);
+  return (state.tracking.settings.whatsapp_template || "").replace(/\{(project|client|amount|due_date)\}/g, (_, k) => f[k]);
+}
+function sendReminder(id) {
+  const name = state.crm.projects[id].latest.name || "";
+  // Open WhatsApp first, directly in the click, so the browser doesn't block the new tab.
+  window.open("https://api.whatsapp.com/send?text=" + encodeURIComponent(reminderText(id)), "_blank", "noopener");
+  navigator.clipboard?.writeText(name).catch(() => {});   // needs HTTPS or localhost; optional
+  const dlg = $("#waConfirm");
+  $("#waConfirmText").innerHTML = `WhatsApp opened with the AMC reminder for <b>${esc(name)}</b>. ` +
+    `The project name is copied, so you can paste it into WhatsApp's search to find the client's group.<br><br>` +
+    `After you've sent it, mark the client as informed here so your colleagues can see it.`;
+  dlg.onclose = async () => {
+    if (dlg.returnValue !== "yes") return;
+    try {
+      const r = await api(`/api/tracking/project/${encodeURIComponent(id)}/informed`, { method: "POST", body: "{}" });
+      if (r.entry) state.tracking.projects[id] = r.entry;
+      await loadChanges(); render();
+      if (state.drawerId === id) {
+        // Update just the reminder parts, so anything typed in the form isn't lost.
+        $("#trackForm")["amc.informed_date"].value = r.entry?.amc?.informed_date || "";
+        $("#waStatus").innerHTML = informedPill(amcInfo(id));
+        state.editBase = r.entry?.updated_at || state.editBase;
+        loadProjectChanges(id);
+      }
+      toast(`Marked ${name} as informed.`);
+    } catch (err) { toast(err.message, true); }
+  };
+  dlg.returnValue = ""; dlg.showModal();
 }
 function amcStagePill(info) {
   const m = AMC_STAGE[info.stage];
@@ -191,7 +241,7 @@ function metrics(rows) {
   const m = { total: rows.length, finished: 0, in_progress: 0, delayed: 0, cancelled: 0, unknown: 0,
     amcPitched: 0, amcReceived: 0, amcDeclined: 0, amcAwaiting: 0, amcAmount: 0, amcQuotedOpen: 0,
     renRenewed: 0, renPending: 0, renLost: 0, renAmount: 0,
-    amcApplies: 0, amcDue: 0, amcDueAmt: 0, amcUnder: 0, amcUnderAmt: 0, amcUpcoming: 0,
+    amcApplies: 0, amcToInform: 0, amcInformed: 0, amcDue: 0, amcDueAmt: 0, amcUnder: 0, amcUnderAmt: 0, amcUpcoming: 0,
     domExpiring: 0, domExpired: 0, domOk: 0, domMissing: 0, domClient: 0, invoiced: 0, paid: 0, due: 0 };
   for (const r of rows) {
     m[r.cat]++;
@@ -199,6 +249,8 @@ function metrics(rows) {
     if (r.amc.stage === "due") { m.amcDue++; m.amcDueAmt += r.amc.amount || 0; }
     if (r.amc.stage === "under") { m.amcUnder++; m.amcUnderAmt += r.amc.amount || 0; }
     if (r.amc.stage === "upcoming") m.amcUpcoming++;
+    if (r.amc.toInform) m.amcToInform++;
+    if (r.amc.applies && r.amc.informed) m.amcInformed++;
     if (r.ds.key === "client") m.domClient++;
     const a = r.t.amc || {}, rn = r.t.renewal || {};
     if (["pitched", "received", "declined"].includes(a.status)) m.amcPitched++;
@@ -238,6 +290,8 @@ function renderCards(rows) {
       detail: `${fmtMoney(m.amcUnderAmt)} outstanding · over ${state.tracking.settings.amc_due_months + state.tracking.settings.amc_grace_months} months old`, go: ["amc", "st_under"] },
     { id: "amcDue", label: statusPill("warning", "!", "") + "AMC due", value: fmtNum(m.amcDue),
       detail: `${fmtMoney(m.amcDueAmt)} · ${m.amcUpcoming} more not due yet`, go: ["amc", "st_due"] },
+    { id: "amcInform", label: (m.amcToInform ? statusPill("warning", "!", "") : "") + "AMC reminders sent", value: fmtNum(m.amcInformed),
+      detail: m.amcToInform ? `${m.amcToInform} due or overdue, client not informed yet` : "Every due client has been informed", go: ["amc", m.amcToInform ? "to_inform" : "informed"] },
     { id: "amcPitched", label: "AMC pitched", value: fmtNum(m.amcPitched), detail: `${m.amcAwaiting} awaiting · ${m.amcDeclined} declined`, go: ["amc", "pitched_any"] },
     { id: "amcReceived", label: "AMC received", value: fmtNum(m.amcReceived), detail: `${pct(m.amcReceived, m.amcPitched)} of pitched converted`, go: ["amc", "st_paid"] },
     { id: "amcAmount", label: "AMC amount received", value: fmtMoney(m.amcAmount), detail: m.amcQuotedOpen ? `${fmtMoney(m.amcQuotedOpen)} quoted, awaiting` : "From recorded payments", go: ["amc", "st_paid"] },
@@ -327,7 +381,15 @@ function renderTable(el, key, columns, rows, emptyMsg) {
     state.sort[key] = { col: i, dir: cur.col === i && cur.dir === "asc" ? "desc" : "asc" };
     render();
   });
-  $$("tbody tr[data-id]", el).forEach((tr) => tr.onclick = (e) => { if (!e.target.closest("a")) openDrawer(tr.dataset.id); });
+  $$("tbody tr[data-id]", el).forEach((tr) => tr.onclick = (e) => {
+    const wa = e.target.closest("[data-wa]");
+    if (wa) return sendReminder(wa.dataset.wa);
+    if (!e.target.closest("a, button")) openDrawer(tr.dataset.id);
+  });
+}
+function lastUpdateCell(r) {
+  if (!r.t.updated_at) return '<span class="meta">Never</span>';
+  return `${esc(new Date(r.t.updated_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short" }))}<div class="meta">${esc(whoLabel(r.t.updated_by, r.t.updated_by_name))}</div>`;
 }
 
 const projCell = (r) => `<span class="name" title="${esc(r.name)}">${orMissing(r.name)}</span><span class="meta">${r.client ? esc(r.client) : MISSING}</span>`;
@@ -366,6 +428,8 @@ function renderAmc(rows) {
     ["st_under", "Under AMC · unpaid", c(st("under"))],
     ["st_due", "AMC due", c(st("due"))],
     ["st_upcoming", "Not due yet", c(st("upcoming"))],
+    ["to_inform", "Still to inform", c((r) => r.amc.toInform)],
+    ["informed", "Client informed", c((r) => r.amc.applies && r.amc.informed)],
     ["st_paid", "AMC received", c(st("paid"))],
     ["pitched_any", "Pitched", c((r) => ["pitched", "received", "declined"].includes(r.t.amc?.status))],
     ["pitched", "Awaiting reply", c((r) => r.t.amc?.status === "pitched")],
@@ -381,6 +445,8 @@ function renderAmc(rows) {
   const list = rows.filter((r) => {
     const a = r.t.amc?.status, rn = r.t.renewal?.status;
     if (!k) return r.amc.applies;
+    if (k === "to_inform") return r.amc.toInform;
+    if (k === "informed") return r.amc.applies && r.amc.informed;
     if (k.startsWith("st_")) return r.amc.stage === k.slice(3);
     if (k === "pitched_any") return ["pitched", "received", "declined"].includes(a);
     if (k === "amc_none") return !a;
@@ -390,10 +456,13 @@ function renderAmc(rows) {
   });
   renderTable($("#amcTable"), "amc", [
     { key: "name", label: "Project / client", render: projCell, csv: (r) => r.name },
+    { key: "stage", label: "AMC", render: (r) => amcStagePill(r.amc), sort: (r) => amcStageSort(r.amc), csv: (r) => amcStageLabel(r.amc) },
+    { key: "inf", label: "Client informed", render: (r) => informedPill(r.amc), sort: (r) => r.amc.informed || (r.amc.toInform ? "0" : "~"), csv: (r) => r.amc.informed || (r.amc.toInform ? "not informed" : "") },
+    ...(canEdit() ? [{ key: "wa", label: "Remind", render: (r) => r.amc.applies ? `<button class="btn small wa-btn" data-wa="${esc(r.id)}" title="Send the AMC reminder on WhatsApp">WhatsApp</button>` : "", sort: (r) => r.amc.toInform ? 0 : 1, csv: () => "" }] : []),
+    { key: "upd", label: "Last update", render: lastUpdateCell, sort: (r) => r.t.updated_at || "", csv: (r) => r.t.updated_at ? `${r.t.updated_at} ${whoLabel(r.t.updated_by, r.t.updated_by_name)}` : "" },
     { key: "start", label: "Started", render: (r) => esc(monthLabel(r.amc.start)), sort: (r) => r.amc.start, csv: (r) => r.amc.start },
     { key: "adue", label: "AMC due", render: (r) => r.amc.applies ? esc(fmtDate(r.amc.dueDate)) : "", sort: (r) => r.amc.dueDate, csv: (r) => r.amc.applies ? r.amc.dueDate : "" },
     { key: "aund", label: "Under AMC from", render: (r) => r.amc.applies ? esc(fmtDate(r.amc.underDate)) : "", sort: (r) => r.amc.underDate, csv: (r) => r.amc.applies ? r.amc.underDate : "" },
-    { key: "stage", label: "AMC", render: (r) => amcStagePill(r.amc), sort: (r) => amcStageSort(r.amc), csv: (r) => amcStageLabel(r.amc) },
     { key: "q", label: "Amount", num: true, render: (r) => r.amc.applies ? esc(fmtMoney(r.amc.amount)) : "", sort: (r) => r.amc.amount, csv: (r) => r.amc.applies ? r.amc.amount : "" },
     { key: "amcs", label: "Pitch status", render: (r) => amcPill(r.t.amc?.status), sort: (r) => r.t.amc?.status, csv: (r) => AMC_LABEL[r.t.amc?.status] || "" },
     { key: "ra", label: "Received", num: true, render: (r) => esc(fmtMoney(r.t.amc?.received_amount)), sort: (r) => r.t.amc?.received_amount, csv: (r) => r.t.amc?.received_amount ?? "" },
@@ -440,10 +509,18 @@ function renderQuality(rows) {
 }
 
 /* -------------------------------------------------------------- activity */
-const canEdit = () => state.user?.role === "editor";
-const whoLabel = (email, name) => email === "import" ? "Imported from old files" : email === "auto" ? "Automatic sync"
-  : email === "local" ? "Local mode" : (name || email || "—");
-const changeFieldLabel = (f) => CHANGE_FIELD[f] || (f.startsWith("settings.") ? "Rule: " + f.slice(9).replace(/_/g, " ") : f);
+const canEdit = () => ["editor", "admin"].includes(state.user?.role);
+const isAdmin = () => state.user?.role === "admin";
+const ROLE_LABEL = { admin: "Admin", editor: "Editor", viewer: "Viewer" };
+const whoLabel = (u, name) => u === "import" ? "Imported from old files" : u === "auto" ? "Automatic sync"
+  : u === "local" ? "Local mode" : u === "command line" ? "Server command line" : (name || u || "—");
+function changeFieldLabel(f) {
+  if (CHANGE_FIELD[f]) return CHANGE_FIELD[f];
+  if (f.startsWith("settings.")) return "Rule: " + f.slice(9).replace(/_/g, " ");
+  const m = f.match(/^user:([^.]+)(?:\.(\w+))?$/);
+  if (m) return `User ${m[1]}` + (m[2] ? `: ${m[2] === "active" ? "access" : m[2]}` : "");
+  return f;
+}
 function changeValue(field, v) {
   if (v == null) return field === "amc.applies" ? "Automatic" : '<span class="meta">(empty)</span>';
   const key = field.split(".").pop();
@@ -451,6 +528,7 @@ function changeValue(field, v) {
   if (field === "renewal.status") return esc(REN_LABEL[v] || v);
   if (field === "amc.applies") return esc({ yes: "Yes", no: "No" }[v] || v);
   if (field === "domain.ownership") return esc({ webelio: "With Webelio", client: "With client" }[v] || v);
+  if (/^user:[^.]+\.role$/.test(field)) return esc(ROLE_LABEL[v] || v);
   if (/_date$|period_end$/.test(key)) return esc(fmtDate(v));
   if (/amount$/.test(key)) return esc(fmtMoney(Number(v)));
   return esc(v);
@@ -458,7 +536,7 @@ function changeValue(field, v) {
 const changeProject = (c) => c.project_id ? state.crm.projects[c.project_id]?.latest?.name || c.project_id : "Dashboard rules";
 const changeColumns = (withProject) => [
   { key: "at", label: "When", render: (c) => esc(new Date(c.at).toLocaleString()), csv: (c) => c.at },
-  { key: "who", label: "Who", render: (c) => esc(whoLabel(c.user_email, c.user_name)), sort: (c) => whoLabel(c.user_email, c.user_name), csv: (c) => c.user_email },
+  { key: "who", label: "Who", render: (c) => esc(whoLabel(c.username, c.user_name)), sort: (c) => whoLabel(c.username, c.user_name), csv: (c) => c.username },
   ...(withProject ? [{ key: "proj", label: "Project", render: (c) => `<span class="name">${esc(changeProject(c))}</span>`, sort: changeProject, csv: changeProject }] : []),
   { key: "field", label: "What changed", render: (c) => esc(changeFieldLabel(c.field)), sort: (c) => changeFieldLabel(c.field), csv: (c) => changeFieldLabel(c.field) },
   { key: "old_value", label: "From", render: (c) => changeValue(c.field, c.old_value), csv: (c) => c.old_value ?? "" },
@@ -467,13 +545,17 @@ const changeColumns = (withProject) => [
 function renderActivity() {
   const q = state.f.search.trim().toLowerCase();
   const list = state.changes.map((c) => ({ ...c, id: c.project_id || "" })).filter((c) => !q ||
-    [whoLabel(c.user_email, c.user_name), c.user_email, changeProject(c), changeFieldLabel(c.field), c.old_value, c.new_value]
+    [whoLabel(c.username, c.user_name), c.username, changeProject(c), changeFieldLabel(c.field), c.old_value, c.new_value]
       .some((x) => x && String(x).toLowerCase().includes(q)));
   renderTable($("#activityTable"), "activity", changeColumns(true), list,
     q ? "No changes match this search." : "No changes yet. Open a project and save its AMC, renewal or domain details to see them here.");
 }
 async function loadChanges() {
-  try { state.changes = (await api("/api/changes?limit=500")).changes; } catch (err) { toast(err.message, true); }
+  // Called after each of our own saves, so the version check doesn't report them as a colleague's.
+  try {
+    const [v, c] = await Promise.all([api("/api/version"), api("/api/changes?limit=500")]);
+    state.version = v; state.changes = c.changes;
+  } catch (err) { toast(err.message, true); }
 }
 async function loadProjectChanges(id) {
   const el = $("#projectChanges"); el.innerHTML = "";
@@ -491,13 +573,52 @@ function renderUser() {
   const u = state.user; if (!u) return;
   const chip = $("#userChip");
   chip.hidden = false;
-  chip.textContent = u.name + (u.role === "viewer" ? " · view only" : "");
-  chip.title = u.email === "local" ? "Login is off because Google sign-in isn't configured" : u.email;
-  $("#logoutBtn").hidden = !state.authEnabled;
+  chip.textContent = u.name + (u.role === "viewer" ? " · view only" : "") + " ▾";
+  chip.title = `Signed in as ${u.username} (${ROLE_LABEL[u.role]}). Click to change your password or sign out.`;
+  $("#usersTabBtn").hidden = !isAdmin();
+  if (state.tab === "users" && !isAdmin()) state.tab = "projects";
   const ro = !canEdit();
   $("#syncBtn").hidden = ro;
   $("#readonlyNote").hidden = !ro;
   $$("#trackForm fieldset, #trackForm button, #settingsForm button, #syncForm button, #syncForm textarea").forEach((el) => (el.disabled = ro));
+}
+
+/* ----------------------------------------------------------------- users */
+async function loadUsers() {
+  try { state.users = (await api("/api/users")).users; } catch (err) { state.users = []; toast(err.message, true); }
+}
+function renderUsers() {
+  if (!state.users) { state.users = []; loadUsers().then(() => state.tab === "users" && render()); }
+  const me = state.user.username;
+  renderTable($("#usersTable"), "users", [
+    { key: "name", label: "Name", render: (u) => `<span class="name">${esc(u.name)}</span><span class="meta">${esc(u.username)}</span>` },
+    { key: "role", label: "Role", render: (u) => `<select data-role="${esc(u.username)}" ${u.username === me ? "disabled title=\"Ask another admin to change your role\"" : ""}>${Object.entries(ROLE_LABEL).map(([k, l]) => `<option value="${k}" ${u.role === k ? "selected" : ""}>${l}</option>`).join("")}</select>` },
+    { key: "active", label: "Access", render: (u) => u.active ? statusPill("good", "✓", "Active") : statusPill("critical", "✕", "Deactivated") },
+    { key: "last_login", label: "Last sign-in", render: (u) => esc(u.last_login ? new Date(u.last_login).toLocaleString() : "Never") },
+    { key: "actions", label: "", render: (u) => `<button class="btn small" data-reset="${esc(u.username)}">Reset password</button> ` +
+      (u.username === me ? "" : `<button class="btn small" data-active="${esc(u.username)}" data-to="${u.active ? 0 : 1}">${u.active ? "Deactivate" : "Reactivate"}</button>`) },
+  ], (state.users || []).map((u) => ({ ...u, id: "" })), "No users yet.");
+  $$("#usersTable tbody tr").forEach((tr) => tr.onclick = null);
+  const update = async (username, body, done) => {
+    try { await api(`/api/users/${encodeURIComponent(username)}`, { method: "PUT", body: JSON.stringify(body) }); toast(done); }
+    catch (err) { toast(err.message, true); }
+    await Promise.all([loadUsers(), loadChanges()]); render();
+  };
+  $$("#usersTable [data-role]").forEach((s) => s.onchange = () => update(s.dataset.role, { role: s.value }, `Role changed to ${ROLE_LABEL[s.value]}.`));
+  $$("#usersTable [data-active]").forEach((b) => b.onclick = () => {
+    const on = b.dataset.to === "1";
+    if (!on && !confirm(`Deactivate ${b.dataset.active}? They'll be signed out and can't sign in until reactivated. Their past changes stay in the log.`)) return;
+    update(b.dataset.active, { active: on }, on ? "Account reactivated." : "Account deactivated.");
+  });
+  $$("#usersTable [data-reset]").forEach((b) => b.onclick = () => {
+    const pw = prompt(`New password for ${b.dataset.reset} (min 8 characters). They'll be signed out and need to use this password.`, randomPassword());
+    if (pw) update(b.dataset.reset, { password: pw }, `Password reset. Share it with ${b.dataset.reset} privately.`);
+  });
+}
+function randomPassword() {
+  const chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const a = crypto.getRandomValues(new Uint32Array(12));
+  return [...a].map((n) => chars[n % chars.length]).join("");
 }
 
 function renderSettings() {
@@ -510,6 +631,7 @@ function renderSettings() {
     form.amc_default_amount.value = s.amc_default_amount;
     form.amc_due_months.value = s.amc_due_months;
     form.amc_grace_months.value = s.amc_grace_months;
+    form.whatsapp_template.value = s.whatsapp_template || "";
     const statuses = [...new Set(Object.values(state.crm.projects).flatMap((p) => Object.values(p.history).map((h) => h.status)).filter(Boolean))]
       .filter((x) => !["Finished", "Cancelled"].includes(x)).sort();
     $("#delayedStatuses").innerHTML = statuses.map((x) => `<label><input type="checkbox" value="${esc(x)}" ${s.delayed_statuses.includes(x) ? "checked" : ""}> ${esc(x)}</label>`).join("");
@@ -518,7 +640,7 @@ function renderSettings() {
   const log = state.crm.sync_log || [];
   renderTable($("#syncLogTable"), "synclog", [
     { key: "at", label: "When", render: (r) => esc(new Date(r.at).toLocaleString()) },
-    { key: "by", label: "By", render: (r) => esc(whoLabel(r.triggered_by, r.triggered_by)) },
+    { key: "by", label: "By", render: (r) => esc(whoLabel(r.triggered_by, r.triggered_by_name)) },
     { key: "months", label: "Months", render: (r) => esc(r.months.length > 4 ? `${r.months.length} months (${monthShort(r.months[0])} – ${monthShort(r.months.at(-1))})` : r.months.map(monthShort).join(", ")) },
     { key: "new_projects", label: "New projects", num: true },
     { key: "sc", label: "Status changes", render: (r) => r.status_changes.length ? r.status_changes.slice(0, 5).map((c) => `${esc(c.name)}: ${esc(c.from)} → ${esc(c.to)}`).join("<br>") + (r.status_changes.length > 5 ? `<br>+${r.status_changes.length - 5} more` : "") : "0" },
@@ -544,6 +666,7 @@ function render() {
   if (state.tab === "activity") renderActivity();
   if (state.tab === "quality") renderQuality(rows);
   if (state.tab === "settings") renderSettings();
+  if (state.tab === "users") renderUsers();
   try { localStorage.setItem("ptd.view", JSON.stringify({ f: state.f, tab: state.tab })); } catch {}
 }
 
@@ -592,9 +715,14 @@ function openDrawer(id) {
     const v = t[sec]?.[key] ?? defaults[el.name];
     if (el.type === "checkbox") el.checked = !!v; else el.value = v ?? "";
   }
+  state.editBase = t.updated_at || null;   // the version being edited, to catch clashing saves
   $("#trackMeta").textContent = t.updated_at
     ? `Last updated ${new Date(t.updated_at).toLocaleString()} by ${whoLabel(t.updated_by, t.updated_by_name)}`
     : "No manual data yet";
+  $("#waBox").hidden = !ai.applies;
+  $("#waPreview").textContent = ai.applies ? reminderText(id) : "";
+  $("#waStatus").innerHTML = informedPill(ai);
+  $("#waSend").onclick = () => sendReminder(id);
   loadProjectChanges(id);
   $("#drawer").classList.add("open"); $("#drawer").setAttribute("aria-hidden", "false");
   $("#drawerBackdrop").hidden = false;
@@ -623,9 +751,10 @@ function exportCsv(tableId, name) {
 
 /* ---------------------------------------------------------------- events */
 async function load() {
-  const [d, me] = await Promise.all([api("/api/data"), api("/api/me")]);
-  state.crm = d.crm; state.tracking = d.tracking;
-  state.user = me; state.authEnabled = me.auth_enabled;
+  // Version first: a change landing between the two calls then triggers a refresh, never gets missed.
+  state.version = await api("/api/version");
+  const d = await api("/api/data");
+  state.crm = d.crm; state.tracking = d.tracking; state.user = d.user;
   // Fallbacks so the page still works if the server is an older version.
   state.tracking.settings = { amc_default_amount: 11800, amc_due_months: 12, amc_grace_months: 2, ...state.tracking.settings };
 }
@@ -664,6 +793,42 @@ function wire() {
     try { await api("/auth/logout", { method: "POST", body: "{}" }); } catch {}
     location.href = "/login.html";
   };
+  $("#userChip").onclick = () => {
+    const u = state.user;
+    $("#accountTitle").textContent = u.name;
+    $("#accountInfo").textContent = `Login ID: ${u.username} · Role: ${ROLE_LABEL[u.role]}`;
+    $("#passwordForm").reset(); $("#accountDialog").showModal();
+  };
+  $("#accountClose").onclick = () => $("#accountDialog").close();
+  $("#passwordForm").onsubmit = async (e) => {
+    e.preventDefault(); const f = e.target;
+    if (f.new.value !== f.repeat.value) return toast("The new passwords don't match.", true);
+    try {
+      await api("/api/me/password", { method: "POST", body: JSON.stringify({ current: f.current.value, new: f.new.value }) });
+      $("#accountDialog").close(); toast("Password changed. You've been signed out on other devices.");
+    } catch (err) { toast(err.message, true); }
+  };
+  $("#genPassword").onclick = () => { $("#userForm").password.value = randomPassword(); };
+  $("#userForm").onsubmit = async (e) => {
+    e.preventDefault(); const f = e.target;
+    const body = { name: f.name.value, username: f.username.value.trim().toLowerCase(), role: f.role.value, password: f.password.value };
+    try {
+      await api("/api/users", { method: "POST", body: JSON.stringify(body) });
+      toast(`Created ${body.username}. Share the login ID and password with them privately.`);
+      f.reset(); await Promise.all([loadUsers(), loadChanges()]); render();
+    } catch (err) { toast(err.message, true); }
+  };
+  // See colleagues' changes without reloading: check every 30 s for anything new.
+  setInterval(async () => {
+    if (document.hidden || !state.version) return;
+    try {
+      const v = await api("/api/version");
+      if (v.changes === state.version.changes && v.syncs === state.version.syncs) return;
+      if (state.drawerId || document.querySelector("dialog[open]")) return;   // don't disturb someone mid-edit
+      await Promise.all([load(), loadChanges()]); fillFilters(); render();
+      toast("Updated with your colleagues' latest changes.");
+    } catch {}
+  }, 30000);
   $("#syncForm").onsubmit = async (e) => {
     e.preventDefault();
     const lines = $("#syncInput").value.split(/\s+/).map((s) => s.trim()).filter(Boolean);
@@ -678,7 +843,8 @@ function wire() {
     e.preventDefault(); const f = e.target;
     const body = { domain_warning_days: +f.domain_warning_days.value, no_deadline_grace_days: +f.no_deadline_grace_days.value,
       currency: f.currency.value, amc_default_amount: +f.amc_default_amount.value,
-      amc_due_months: +f.amc_due_months.value, amc_grace_months: +f.amc_grace_months.value, delayed_statuses: $$("#delayedStatuses input:checked").map((i) => i.value) };
+      amc_due_months: +f.amc_due_months.value, amc_grace_months: +f.amc_grace_months.value,
+      whatsapp_template: f.whatsapp_template.value, delayed_statuses: $$("#delayedStatuses input:checked").map((i) => i.value) };
     try { const r = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) }); state.tracking.settings = r.settings; await loadChanges(); render(); toast("Rules saved."); }
     catch (err) { toast(err.message, true); }
   };
@@ -691,6 +857,7 @@ function wire() {
     }
     if (!body.domain.name && !body.domain.expiry_date) { body.domain.auto_renew = false; delete body.domain.ownership; }
     if (!body.domain.auto_renew) delete body.domain.auto_renew;
+    body.base_updated_at = state.editBase;
     try {
       const r = await api(`/api/tracking/project/${encodeURIComponent(state.drawerId)}`, { method: "PUT", body: JSON.stringify(body) });
       if (r.entry) state.tracking.projects[state.drawerId] = r.entry; else delete state.tracking.projects[state.drawerId];

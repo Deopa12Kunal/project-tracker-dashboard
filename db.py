@@ -4,11 +4,11 @@ SQLite storage for the tracker (one file: data/tracker.db by default).
 Tables
     crm_projects, crm_snapshots, crm_months, sync_log   - imported from the CRM (sync only)
     tracking                                           - AMC / renewal / domain, edited in the portal
-    change_log                                         - every field change: who, when, old -> new
-    users, sessions                                    - Google sign-in
+    change_log                                         - every change: who, when, field, old -> new
+    users, sessions                                    - logins created by an admin
     meta                                               - settings, last sync time, etc.
 
-Backup:  python db.py backup /path/to/backup.db   (safe while the server is running)
+User accounts and backups are managed with manage.py.
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ import json
 import os
 import secrets
 import sqlite3
-import sys
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -27,6 +26,16 @@ DB_PATH = config.DB_PATH
 LEGACY_STORE = os.path.join(config.DATA_DIR, "crm_store.json")
 LEGACY_TRACKING = os.path.join(config.DATA_DIR, "tracking.json")
 
+DEFAULT_WHATSAPP_TEMPLATE = (
+    "Dear {client},\n\n"
+    "This is a friendly reminder from Webelio that the Annual Maintenance Contract (AMC) "
+    "for your website *{project}* is due for renewal.\n\n"
+    "AMC amount: *{amount}* (incl. GST)\n"
+    "Due date: {due_date}\n\n"
+    "Kindly arrange the payment at your earliest convenience. "
+    "Please reach out if you have any questions.\n\n"
+    "Thank you,\nTeam Webelio"
+)
 DEFAULT_SETTINGS = {
     "domain_warning_days": 30,
     "delayed_statuses": ["On Hold", "Disputed", "Not Responding"],
@@ -37,8 +46,10 @@ DEFAULT_SETTINGS = {
     "amc_default_amount": 11800,   # incl. GST
     "amc_due_months": 12,
     "amc_grace_months": 2,
+    "whatsapp_template": DEFAULT_WHATSAPP_TEMPLATE,
 }
 TRACKED_SECTIONS = ("amc", "renewal", "domain")
+ROLES = ("admin", "editor", "viewer")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -83,7 +94,7 @@ CREATE TABLE IF NOT EXISTS tracking (
 CREATE TABLE IF NOT EXISTS change_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     at         TEXT NOT NULL,
-    user_email TEXT,
+    username   TEXT,
     project_id TEXT,
     field      TEXT NOT NULL,
     old_value  TEXT,
@@ -91,19 +102,27 @@ CREATE TABLE IF NOT EXISTS change_log (
 );
 CREATE INDEX IF NOT EXISTS change_log_project ON change_log (project_id, id);
 CREATE TABLE IF NOT EXISTS users (
-    email       TEXT PRIMARY KEY,
-    name        TEXT,
-    picture     TEXT,
-    first_login TEXT,
-    last_login  TEXT
+    username            TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    password_hash       TEXT NOT NULL,
+    active              INTEGER NOT NULL DEFAULT 1,
+    created_at          TEXT NOT NULL,
+    created_by          TEXT,
+    password_changed_at TEXT,
+    last_login          TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
-    email      TEXT NOT NULL,
+    username   TEXT NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
 """
+
+
+class Conflict(Exception):
+    """Someone else saved the same record after this person opened it."""
 
 
 def now() -> str:
@@ -138,14 +157,28 @@ def _set_meta(c, key, value):
               (key, json.dumps(value, ensure_ascii=False)))
 
 
+def _log(c, at, username, project_id, rows):
+    c.executemany("INSERT INTO change_log (at, username, project_id, field, old_value, new_value) "
+                  "VALUES (?, ?, ?, ?, ?, ?)", [(at, username, project_id, *r) for r in rows])
+
+
 # --------------------------------------------------------------------------- #
-# Setup + one-time import of the old JSON files
+# Setup, upgrades of older databases, one-time import of the old JSON files
 # --------------------------------------------------------------------------- #
 def init(log=print) -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     c = sqlite3.connect(DB_PATH, timeout=30)
     try:
         c.execute("PRAGMA journal_mode=WAL")
+        cols = lambda t: [r[1] for r in c.execute(f"PRAGMA table_info({t})")]
+        # Earlier version used Google sign-in (users keyed by email). No passwords to keep.
+        if "email" in cols("users"):
+            c.execute("DROP TABLE users")
+        if "email" in cols("sessions"):
+            c.execute("DROP TABLE sessions")
+        if "user_email" in cols("change_log"):
+            c.execute("ALTER TABLE change_log RENAME COLUMN user_email TO username")
+        c.commit()
         c.executescript(SCHEMA)
     finally:
         c.close()
@@ -190,11 +223,6 @@ def project_count() -> int:
         return c.execute("SELECT COUNT(*) FROM crm_projects").fetchone()[0]
 
 
-def project_exists(pid: str) -> bool:
-    with _db() as c:
-        return c.execute("SELECT 1 FROM crm_projects WHERE id = ?", (pid,)).fetchone() is not None
-
-
 def load_store(include_log: bool = True) -> dict:
     with _db() as c:
         projects = {}
@@ -221,10 +249,11 @@ def load_store(include_log: bool = True) -> dict:
         sync_log = []
         if include_log:
             for r in c.execute("SELECT s.at, s.triggered_by, s.entry, u.name FROM sync_log s "
-                               "LEFT JOIN users u ON u.email = s.triggered_by "
+                               "LEFT JOIN users u ON u.username = s.triggered_by "
                                "ORDER BY s.id DESC LIMIT 50"):
                 e = json.loads(r["entry"])
-                e["triggered_by"] = r["name"] or r["triggered_by"]
+                e["triggered_by"] = r["triggered_by"]
+                e["triggered_by_name"] = r["name"]
                 sync_log.append(e)
         return {"source": _get_meta(c, "source"), "last_synced": _get_meta(c, "last_synced"),
                 "months_available": _get_meta(c, "months_available", []),
@@ -262,17 +291,16 @@ def save_store(store: dict, sync_entry: dict | None = None, triggered_by: str | 
 # --------------------------------------------------------------------------- #
 # Manual tracking (AMC / renewal / domain) with a change log
 # --------------------------------------------------------------------------- #
-def _entry(r) -> dict:
+def _entry(r, name=None) -> dict:
     return {**{s: json.loads(r[s] or "{}") for s in TRACKED_SECTIONS}, "notes": r["notes"] or "",
-            "updated_at": r["updated_at"], "updated_by": r["updated_by"],
-            "updated_by_name": r["name"] if "name" in r.keys() else None}
+            "updated_at": r["updated_at"], "updated_by": r["updated_by"], "updated_by_name": name}
 
 
 def load_tracking() -> dict:
     with _db() as c:
         settings = {**DEFAULT_SETTINGS, **_get_meta(c, "settings", {})}
-        projects = {r["project_id"]: _entry(r) for r in c.execute(
-            "SELECT t.*, u.name FROM tracking t LEFT JOIN users u ON u.email = t.updated_by")}
+        projects = {r["project_id"]: _entry(r, r["name"]) for r in c.execute(
+            "SELECT t.*, u.name FROM tracking t LEFT JOIN users u ON u.username = t.updated_by")}
     return {"settings": settings, "projects": projects}
 
 
@@ -305,49 +333,68 @@ def _diff(old: dict, new: dict) -> list[tuple[str, str | None, str | None]]:
     return out
 
 
-def save_tracking(pid: str, new: dict, user_email: str) -> dict | None:
-    """Save one project's manual data. Logs each changed field. Returns the stored entry."""
+def _write_tracking(c, pid: str, old: dict | None, new: dict, username: str) -> dict | None:
+    changes = _diff(_flat(old), _flat(new))
+    if not changes:
+        return old
+    at = now()
+    if not any(new.get(s) for s in TRACKED_SECTIONS) and not new.get("notes"):
+        c.execute("DELETE FROM tracking WHERE project_id = ?", (pid,))
+        result = None
+    else:
+        c.execute("INSERT OR REPLACE INTO tracking VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (pid, *(json.dumps(new.get(s) or {}, ensure_ascii=False) for s in TRACKED_SECTIONS),
+                   new.get("notes") or "", at, username))
+        u = c.execute("SELECT name FROM users WHERE username = ?", (username,)).fetchone()
+        result = {**{s: new.get(s) or {} for s in TRACKED_SECTIONS}, "notes": new.get("notes") or "",
+                  "updated_at": at, "updated_by": username, "updated_by_name": u["name"] if u else None}
+    _log(c, at, username, pid, changes)
+    return result
+
+
+def _current(c, pid: str) -> dict | None:
+    if not c.execute("SELECT 1 FROM crm_projects WHERE id = ?", (pid,)).fetchone():
+        raise KeyError(pid)
+    r = c.execute("SELECT t.*, u.name FROM tracking t LEFT JOIN users u ON u.username = t.updated_by "
+                  "WHERE project_id = ?", (pid,)).fetchone()
+    return _entry(r, r["name"]) if r else None
+
+
+def save_tracking(pid: str, new: dict, username: str, base_updated_at: str | None = "any") -> dict | None:
+    """Save one project's manual data and log each changed field.
+    base_updated_at is the version the person was editing; if someone else has
+    saved since, Conflict is raised instead of overwriting their change."""
     with _db(write=True) as c:
-        if not c.execute("SELECT 1 FROM crm_projects WHERE id = ?", (pid,)).fetchone():
-            raise KeyError(pid)
-        r = c.execute("SELECT * FROM tracking WHERE project_id = ?", (pid,)).fetchone()
-        old = _entry(r) if r else None
-        changes = _diff(_flat(old), _flat(new))
-        if not changes:
-            return old
-        at = now()
-        if not any(new.get(s) for s in TRACKED_SECTIONS) and not new.get("notes"):
-            c.execute("DELETE FROM tracking WHERE project_id = ?", (pid,))
-            result = None
-        else:
-            c.execute("INSERT OR REPLACE INTO tracking VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (pid, *(json.dumps(new.get(s) or {}, ensure_ascii=False) for s in TRACKED_SECTIONS),
-                       new.get("notes") or "", at, user_email))
-            result = {**{s: new.get(s) or {} for s in TRACKED_SECTIONS}, "notes": new.get("notes") or "",
-                      "updated_at": at, "updated_by": user_email}
-        c.executemany("INSERT INTO change_log (at, user_email, project_id, field, old_value, new_value) "
-                      "VALUES (?, ?, ?, ?, ?, ?)", [(at, user_email, pid, *ch) for ch in changes])
-        if result:
-            u = c.execute("SELECT name FROM users WHERE email = ?", (user_email,)).fetchone()
-            result["updated_by_name"] = u["name"] if u else None
-        return result
+        old = _current(c, pid)
+        if base_updated_at != "any" and (old or {}).get("updated_at") != base_updated_at:
+            who = (old or {}).get("updated_by_name") or (old or {}).get("updated_by") or "someone"
+            raise Conflict(f"{who} changed this project while you were editing it. "
+                           "Close it and open it again to see their changes, then redo yours.")
+        return _write_tracking(c, pid, old, new, username)
 
 
-def save_settings(settings: dict, user_email: str) -> dict:
+def mark_informed(pid: str, date: str, username: str) -> dict | None:
+    """Record that the client was sent the AMC reminder (only this one field changes)."""
+    with _db(write=True) as c:
+        old = _current(c, pid)
+        new = json.loads(json.dumps(old or {s: {} for s in TRACKED_SECTIONS}))
+        new.setdefault("amc", {})["informed_date"] = date
+        return _write_tracking(c, pid, old, new, username)
+
+
+def save_settings(settings: dict, username: str) -> dict:
     with _db(write=True) as c:
         old = {**DEFAULT_SETTINGS, **_get_meta(c, "settings", {})}
-        changes = _diff({f"settings.{k}": (", ".join(v) if isinstance(v, list) else v) for k, v in old.items()},
-                        {f"settings.{k}": (", ".join(v) if isinstance(v, list) else v) for k, v in settings.items()})
+        flat = lambda s: {f"settings.{k}": (", ".join(v) if isinstance(v, list) else v) for k, v in s.items()}
+        changes = _diff(flat(old), flat(settings))
         _set_meta(c, "settings", settings)
-        at = now()
-        c.executemany("INSERT INTO change_log (at, user_email, project_id, field, old_value, new_value) "
-                      "VALUES (?, ?, NULL, ?, ?, ?)", [(at, user_email, *ch) for ch in changes])
+        _log(c, now(), username, None, changes)
     return settings
 
 
 def changes(project_id: str | None = None, limit: int = 100) -> list[dict]:
     sql = ("SELECT l.*, u.name AS user_name FROM change_log l "
-           "LEFT JOIN users u ON u.email = l.user_email")
+           "LEFT JOIN users u ON u.username = l.username")
     args: list = []
     if project_id:
         sql += " WHERE l.project_id = ?"
@@ -358,45 +405,112 @@ def changes(project_id: str | None = None, limit: int = 100) -> list[dict]:
         return [dict(r) for r in c.execute(sql, args)]
 
 
+def version() -> dict:
+    """Cheap fingerprint so open dashboards can tell when someone else changed something."""
+    with _db() as c:
+        return {"changes": c.execute("SELECT COALESCE(MAX(id), 0) FROM change_log").fetchone()[0],
+                "syncs": c.execute("SELECT COALESCE(MAX(id), 0) FROM sync_log").fetchone()[0]}
+
+
 # --------------------------------------------------------------------------- #
-# Users + sessions (only a hash of the session token is stored)
+# Users (created by an admin) and sessions (only a hash of the token is stored)
 # --------------------------------------------------------------------------- #
+PUBLIC_USER_FIELDS = "username, name, role, active, created_at, created_by, password_changed_at, last_login"
+
+
+def user_count(active_admins_only: bool = False) -> int:
+    sql = "SELECT COUNT(*) FROM users" + (" WHERE role = 'admin' AND active = 1" if active_admins_only else "")
+    with _db() as c:
+        return c.execute(sql).fetchone()[0]
+
+
+def list_users() -> list[dict]:
+    with _db() as c:
+        return [dict(r) for r in c.execute(f"SELECT {PUBLIC_USER_FIELDS} FROM users ORDER BY username")]
+
+
+def get_user(username: str, with_hash: bool = False) -> dict | None:
+    cols = "*" if with_hash else PUBLIC_USER_FIELDS
+    with _db() as c:
+        r = c.execute(f"SELECT {cols} FROM users WHERE username = ?", (username,)).fetchone()
+        return dict(r) if r else None
+
+
+def create_user(username: str, name: str, role: str, password_hash: str, by: str) -> dict:
+    at = now()
+    with _db(write=True) as c:
+        if c.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+            raise ValueError(f"The login ID '{username}' is already taken")
+        c.execute("INSERT INTO users (username, name, role, password_hash, active, created_at, created_by, "
+                  "password_changed_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                  (username, name, role, password_hash, at, by, at))
+        _log(c, at, by, None, [(f"user:{username}", None, f"Created: {name} ({role})")])
+    return get_user(username)
+
+
+def update_user(username: str, by: str, *, name=None, role=None, active=None, password_hash=None) -> dict:
+    """Admin changes to an account. Signs the person out when they lose access or get a new password."""
+    with _db(write=True) as c:
+        old = c.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if not old:
+            raise KeyError(username)
+        new_role = role if role is not None else old["role"]
+        new_active = int(active) if active is not None else old["active"]
+        if old["role"] == "admin" and old["active"] and (new_role != "admin" or not new_active):
+            admins = c.execute("SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1").fetchone()[0]
+            if admins <= 1:
+                raise ValueError("This is the only active admin. Make someone else an admin first.")
+        at = now()
+        rows = []
+        if name is not None and name != old["name"]:
+            c.execute("UPDATE users SET name = ? WHERE username = ?", (name, username))
+            rows.append((f"user:{username}.name", old["name"], name))
+        if new_role != old["role"]:
+            c.execute("UPDATE users SET role = ? WHERE username = ?", (new_role, username))
+            rows.append((f"user:{username}.role", old["role"], new_role))
+        if new_active != old["active"]:
+            c.execute("UPDATE users SET active = ? WHERE username = ?", (new_active, username))
+            rows.append((f"user:{username}.active", "Active" if old["active"] else "Deactivated",
+                         "Active" if new_active else "Deactivated"))
+        if password_hash:
+            c.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE username = ?",
+                      (password_hash, at, username))
+            rows.append((f"user:{username}.password", None, "Password changed" if by == username else "Password reset"))
+        if password_hash or not new_active:
+            c.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        _log(c, at, by, None, rows)
+    return get_user(username)
+
+
+def touch_login(username: str) -> None:
+    with _db(write=True) as c:
+        c.execute("UPDATE users SET last_login = ? WHERE username = ?", (now(), username))
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def upsert_user(email: str, name: str | None, picture: str | None) -> None:
-    at = now()
-    with _db(write=True) as c:
-        c.execute("INSERT INTO users (email, name, picture, first_login, last_login) VALUES (?, ?, ?, ?, ?) "
-                  "ON CONFLICT(email) DO UPDATE SET name = excluded.name, picture = excluded.picture, "
-                  "last_login = excluded.last_login", (email, name, picture, at, at))
-
-
-def get_user(email: str) -> dict | None:
-    with _db() as c:
-        r = c.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-        return dict(r) if r else None
-
-
-def create_session(email: str, days: float) -> str:
+def create_session(username: str, days: float) -> str:
     token = secrets.token_urlsafe(32)
     at = datetime.now(timezone.utc)
     with _db(write=True) as c:
         c.execute("DELETE FROM sessions WHERE expires_at < ?", (at.isoformat(timespec="seconds"),))
         c.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)",
-                  (_hash(token), email, at.isoformat(timespec="seconds"),
+                  (_hash(token), username, at.isoformat(timespec="seconds"),
                    (at + timedelta(days=days)).isoformat(timespec="seconds")))
     return token
 
 
-def session_email(token: str | None) -> str | None:
+def session_user(token: str | None) -> dict | None:
+    """The signed-in user for this session token, if the session and the account are still valid."""
     if not token:
         return None
     with _db() as c:
-        r = c.execute("SELECT email FROM sessions WHERE token_hash = ? AND expires_at > ?",
+        r = c.execute("SELECT u.username, u.name, u.role FROM sessions s JOIN users u ON u.username = s.username "
+                      "WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1",
                       (_hash(token), now())).fetchone()
-        return r["email"] if r else None
+        return dict(r) if r else None
 
 
 def delete_session(token: str | None) -> None:
@@ -405,7 +519,6 @@ def delete_session(token: str | None) -> None:
             c.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash(token),))
 
 
-# --------------------------------------------------------------------------- #
 def backup(dest: str) -> None:
     src = sqlite3.connect(DB_PATH)
     dst = sqlite3.connect(dest)
@@ -414,12 +527,3 @@ def backup(dest: str) -> None:
     finally:
         dst.close()
         src.close()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "backup":
-        init()
-        backup(sys.argv[2])
-        print("Backed up to", sys.argv[2])
-    else:
-        print("Usage: python db.py backup /path/to/backup.db")
