@@ -3,22 +3,29 @@ SQLite storage for the tracker (one file: data/tracker.db by default).
 
 Tables
     crm_projects, crm_snapshots, crm_months, sync_log   - imported from the CRM (sync only)
-    tracking                                           - AMC / renewal / domain, edited in the portal
+    tracking                                           - AMC / renewal / domain, edited in the portal:
+                                                         one typed column per field (see FIELDS)
     change_log                                         - every change: who, when, field, old -> new
     users, sessions                                    - logins created by an admin
     meta                                               - settings, last sync time, etc.
 
 User accounts and backups are managed with manage.py.
+
+To add a field to the project panel: add it to FIELDS (and CHOICES if it has fixed values),
+and add an input named "<section>.<field>" to static/index.html. The column is added to the
+database the next time the server starts.
 """
 from __future__ import annotations
 
 import contextlib
 import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import config
 
@@ -48,8 +55,141 @@ DEFAULT_SETTINGS = {
     "amc_grace_months": 2,
     "whatsapp_template": DEFAULT_WHATSAPP_TEMPLATE,
 }
-TRACKED_SECTIONS = ("amc", "renewal", "domain")
 ROLES = ("admin", "editor", "viewer")
+
+# --------------------------------------------------------------------------- #
+# Fields people fill in for each project. Each one is its own column in the
+# `tracking` table, named <section>_<field> (e.g. amc_status, domain_expiry_date).
+#   str  - text           date - YYYY-MM-DD (a real calendar date)
+#   num  - amount, >= 0   bool - yes/no (stored as 1/0)
+# A blank value means "not recorded" and is stored as NULL.
+# --------------------------------------------------------------------------- #
+FIELDS = {
+    "amc": {"applies": "str", "status": "str", "pitched_date": "date", "quoted_amount": "num",
+            "received_amount": "num", "received_date": "date", "period_end": "date",
+            "informed_date": "date", "notes": "str"},
+    "renewal": {"status": "str", "due_date": "date", "renewed_date": "date", "amount": "num",
+                "notes": "str"},
+    "domain": {"name": "str", "ownership": "str", "registrar": "str", "expiry_date": "date",
+               "auto_renew": "bool", "notes": "str"},
+}
+# Fields that only accept these values (blank is always allowed).
+CHOICES = {
+    "amc.applies": ("yes", "no"),           # blank = automatic (website projects only)
+    "amc.status": ("not_pitched", "pitched", "received", "declined"),
+    "renewal.status": ("not_due", "pending", "renewed", "lost"),
+    "domain.ownership": ("webelio", "client"),
+}
+TRACKED_SECTIONS = tuple(FIELDS)
+TRACKING_COLUMNS = [(sec, key, kind) for sec, fs in FIELDS.items() for key, kind in fs.items()]
+MAX_TEXT = 2000       # per text field
+MAX_NOTES = 4000      # project-level notes
+SCHEMA_VERSION = 2    # 1 = AMC / renewal / domain stored as JSON text; 2 = one column per field
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _col(sec: str, key: str) -> str:
+    return f"{sec}_{key}"
+
+
+def _column_ddl(sec: str, key: str, kind: str) -> str:
+    """Column definition with a CHECK, so the database itself refuses wrong values."""
+    col = _col(sec, key)
+    choices = CHOICES.get(f"{sec}.{key}")
+    if choices:
+        return f"{col} TEXT CHECK ({col} IN ({', '.join(repr(v) for v in choices)}))"
+    if kind == "num":
+        return f"{col} REAL CHECK ({col} IS NULL OR (typeof({col}) = 'real' AND {col} >= 0))"
+    if kind == "date":
+        return (f"{col} TEXT CHECK ({col} IS NULL OR ({col} GLOB "
+                f"'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date({col}) IS {col}))")
+    if kind == "bool":
+        return f"{col} INTEGER CHECK ({col} IN (0, 1))"
+    return f"{col} TEXT CHECK ({col} IS NULL OR (typeof({col}) = 'text' AND length({col}) BETWEEN 1 AND {MAX_TEXT}))"
+
+
+TRACKING_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS tracking (\n"
+    "    project_id TEXT PRIMARY KEY,\n"
+    + "".join(f"    {_column_ddl(*f)},\n" for f in TRACKING_COLUMNS)
+    + f"    notes      TEXT NOT NULL DEFAULT '' CHECK (length(notes) <= {MAX_NOTES}),\n"
+    "    updated_at TEXT,\n"
+    "    updated_by TEXT\n"
+    ")"
+)
+_TRACKING_INSERT = (
+    f"INSERT OR REPLACE INTO tracking (project_id, "
+    f"{', '.join(_col(s, k) for s, k, _ in TRACKING_COLUMNS)}, notes, updated_at, updated_by) "
+    f"VALUES ({', '.join('?' * (len(TRACKING_COLUMNS) + 4))})"
+)
+
+
+def _clean_value(name: str, kind: str, v, strict: bool):
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    if kind == "num":
+        try:
+            v = float(str(v).replace(",", ""))
+        except ValueError:
+            raise ValueError(f"'{name}' must be a number")
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"'{name}' must be zero or more")
+    elif kind == "date":
+        v = str(v).strip()
+        try:
+            ok = bool(_DATE_RE.match(v)) and bool(date.fromisoformat(v))
+        except ValueError:
+            ok = False
+        if not ok:
+            raise ValueError(f"'{name}' must be a real date (YYYY-MM-DD)")
+    elif kind == "bool":
+        v = bool(v)
+    else:
+        v = str(v).strip()
+        choices = CHOICES.get(name)
+        if choices and v not in choices:
+            raise ValueError(f"Unknown value '{v}' for '{name}' (allowed: {', '.join(choices)})")
+        if len(v) > MAX_TEXT:
+            if strict:
+                raise ValueError(f"'{name}' is longer than {MAX_TEXT} characters")
+            v = v[:MAX_TEXT]
+    return v
+
+
+def clean_entry(body: dict | None, strict: bool = False) -> dict:
+    """Check one project's AMC / renewal / domain data and give every field its type.
+    Blank values are left out. Unknown fields are ignored, or refused when `strict`
+    (used for data already stored, so nothing is ever dropped without notice)."""
+    body = body or {}
+    out = {}
+    for sec, fields in FIELDS.items():
+        given = body.get(sec) or {}
+        if not isinstance(given, dict):
+            raise ValueError(f"'{sec}' must be an object")
+        if strict:
+            extra = [f"{sec}.{k}" for k, v in given.items() if k not in fields and v not in (None, "")]
+            if extra:
+                raise ValueError(f"unknown field(s): {', '.join(extra)}")
+        out[sec] = {}
+        for key, kind in fields.items():
+            v = _clean_value(f"{sec}.{key}", kind, given.get(key), strict)
+            if v is not None:
+                out[sec][key] = v
+    notes = str(body.get("notes") or "").strip()
+    if len(notes) > MAX_NOTES:
+        if strict:
+            raise ValueError(f"notes are longer than {MAX_NOTES} characters")
+        notes = notes[:MAX_NOTES]
+    out["notes"] = notes
+    return out
+
+
+def _tracking_row(pid: str, e: dict, at: str | None, by: str | None) -> list:
+    vals = [pid]
+    for sec, key, kind in TRACKING_COLUMNS:
+        v = e[sec].get(key)
+        vals.append(int(v) if kind == "bool" and v is not None else v)
+    return vals + [e["notes"], at, by]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -81,15 +221,6 @@ CREATE TABLE IF NOT EXISTS sync_log (
     at           TEXT NOT NULL,
     triggered_by TEXT,
     entry        TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tracking (
-    project_id TEXT PRIMARY KEY,
-    amc        TEXT NOT NULL DEFAULT '{}',
-    renewal    TEXT NOT NULL DEFAULT '{}',
-    domain     TEXT NOT NULL DEFAULT '{}',
-    notes      TEXT NOT NULL DEFAULT '',
-    updated_at TEXT,
-    updated_by TEXT
 );
 CREATE TABLE IF NOT EXISTS change_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,13 +310,54 @@ def init(log=print) -> None:
         if "user_email" in cols("change_log"):
             c.execute("ALTER TABLE change_log RENAME COLUMN user_email TO username")
         c.commit()
-        c.executescript(SCHEMA)
+        c.executescript(SCHEMA)   # (the tracking table is set up below)
+        old_json_format = "amc" in cols("tracking")
+        if not old_json_format:
+            c.execute(TRACKING_SCHEMA)
+            have = set(cols("tracking"))
+            for sec, key, kind in TRACKING_COLUMNS:     # fields added to FIELDS since this database was made
+                if _col(sec, key) not in have:
+                    c.execute(f"ALTER TABLE tracking ADD COLUMN {_column_ddl(sec, key, kind)}")
+                    log(f"Added database column tracking.{_col(sec, key)}")
+            c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            c.commit()
     finally:
         c.close()
+    if old_json_format:
+        _migrate_tracking_to_columns(log)
     with _db() as c:
         imported = _get_meta(c, "legacy_imported", False)
     if not imported:
         _import_legacy(log)
+
+
+def _migrate_tracking_to_columns(log) -> None:
+    """Move AMC / renewal / domain data from JSON text into one typed column per field.
+    Takes a backup first and runs as one transaction: if any stored value doesn't fit,
+    nothing is changed and the server doesn't start until it is fixed."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    copy = os.path.join(os.path.dirname(DB_PATH), f"tracker-before-columns-{stamp}.db")
+    backup(copy)
+    log(f"Upgrading the tracking table to one column per field (backup: {copy})")
+    try:
+        with _db(write=True) as c:
+            rows = c.execute("SELECT * FROM tracking").fetchall()
+            c.execute("ALTER TABLE tracking RENAME TO tracking_json_v1")
+            c.execute(TRACKING_SCHEMA)
+            for r in rows:
+                raw = {s: json.loads(r[s] or "{}") for s in FIELDS}
+                raw["notes"] = r["notes"]
+                try:
+                    e = clean_entry(raw, strict=True)
+                except ValueError as err:
+                    raise ValueError(f"project {r['project_id']}: {err}")
+                c.execute(_TRACKING_INSERT, _tracking_row(r["project_id"], e, r["updated_at"], r["updated_by"]))
+            c.execute("DROP TABLE tracking_json_v1")
+            c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    except (ValueError, sqlite3.DatabaseError) as err:
+        raise SystemExit(f"Could not upgrade the tracking table ({err}). Nothing was changed. "
+                         f"Correct that value in the old JSON column, then start again.")
+    log(f"Moved {len(rows)} tracking records into typed columns")
 
 
 def _import_legacy(log) -> None:
@@ -207,9 +379,11 @@ def _import_legacy(log) -> None:
         if tracking:
             _set_meta(c, "settings", {**DEFAULT_SETTINGS, **tracking.get("settings", {})})
             for pid, t in tracking.get("projects", {}).items():
-                c.execute("INSERT OR REPLACE INTO tracking VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (pid, *(json.dumps(t.get(s) or {}, ensure_ascii=False) for s in TRACKED_SECTIONS),
-                           t.get("notes") or "", t.get("updated_at"), "import"))
+                try:
+                    e = clean_entry(t, strict=True)
+                except ValueError as err:
+                    raise SystemExit(f"Could not import {LEGACY_TRACKING}: project {pid}: {err}")
+                c.execute(_TRACKING_INSERT, _tracking_row(pid, e, t.get("updated_at"), "import"))
             log(f"Imported settings and {len(tracking.get('projects', {}))} tracking records "
                 f"from {LEGACY_TRACKING}")
         _set_meta(c, "legacy_imported", True)
@@ -292,7 +466,13 @@ def save_store(store: dict, sync_entry: dict | None = None, triggered_by: str | 
 # Manual tracking (AMC / renewal / domain) with a change log
 # --------------------------------------------------------------------------- #
 def _entry(r, name=None) -> dict:
-    return {**{s: json.loads(r[s] or "{}") for s in TRACKED_SECTIONS}, "notes": r["notes"] or "",
+    """A tracking row in the shape the dashboard uses: {"amc": {...}, "renewal": {...}, ...}."""
+    e = {sec: {} for sec in FIELDS}
+    for sec, key, kind in TRACKING_COLUMNS:
+        v = r[_col(sec, key)]
+        if v is not None:
+            e[sec][key] = bool(v) if kind == "bool" else v
+    return {**e, "notes": r["notes"] or "",
             "updated_at": r["updated_at"], "updated_by": r["updated_by"], "updated_by_name": name}
 
 
@@ -334,20 +514,18 @@ def _diff(old: dict, new: dict) -> list[tuple[str, str | None, str | None]]:
 
 
 def _write_tracking(c, pid: str, old: dict | None, new: dict, username: str) -> dict | None:
+    new = clean_entry(new)
     changes = _diff(_flat(old), _flat(new))
     if not changes:
         return old
     at = now()
-    if not any(new.get(s) for s in TRACKED_SECTIONS) and not new.get("notes"):
+    if not any(new[s] for s in FIELDS) and not new["notes"]:
         c.execute("DELETE FROM tracking WHERE project_id = ?", (pid,))
         result = None
     else:
-        c.execute("INSERT OR REPLACE INTO tracking VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (pid, *(json.dumps(new.get(s) or {}, ensure_ascii=False) for s in TRACKED_SECTIONS),
-                   new.get("notes") or "", at, username))
+        c.execute(_TRACKING_INSERT, _tracking_row(pid, new, at, username))
         u = c.execute("SELECT name FROM users WHERE username = ?", (username,)).fetchone()
-        result = {**{s: new.get(s) or {} for s in TRACKED_SECTIONS}, "notes": new.get("notes") or "",
-                  "updated_at": at, "updated_by": username, "updated_by_name": u["name"] if u else None}
+        result = {**new, "updated_at": at, "updated_by": username, "updated_by_name": u["name"] if u else None}
     _log(c, at, username, pid, changes)
     return result
 
@@ -361,7 +539,8 @@ def _current(c, pid: str) -> dict | None:
 
 
 def save_tracking(pid: str, new: dict, username: str, base_updated_at: str | None = "any") -> dict | None:
-    """Save one project's manual data and log each changed field.
+    """Save one project's manual data and log each changed field. `new` is checked and
+    typed with clean_entry, so a wrong value raises ValueError and nothing is saved.
     base_updated_at is the version the person was editing; if someone else has
     saved since, Conflict is raised instead of overwriting their change."""
     with _db(write=True) as c:

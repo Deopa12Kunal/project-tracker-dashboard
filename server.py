@@ -31,44 +31,8 @@ SESSION_COOKIE = "ptd_session"
 PUBLIC_FILES = {"/login.html", "/styles.css"}
 LOOPBACK = {"127.0.0.1", "::1"}
 
-AMC_STATUSES = {"", "not_pitched", "pitched", "received", "declined"}
-AMC_APPLIES = {"", "yes", "no"}          # "" = automatic (website projects only)
-RENEWAL_STATUSES = {"", "not_due", "pending", "renewed", "lost"}
-DOMAIN_OWNERS = {"", "webelio", "client"}
-
-AMC_FIELDS = {"applies": "str", "status": "str", "pitched_date": "date", "quoted_amount": "num",
-              "received_amount": "num", "received_date": "date", "period_end": "date",
-              "informed_date": "date", "notes": "str"}
-RENEWAL_FIELDS = {"status": "str", "due_date": "date", "renewed_date": "date",
-                  "amount": "num", "notes": "str"}
-DOMAIN_FIELDS = {"name": "str", "ownership": "str", "registrar": "str", "expiry_date": "date",
-                 "auto_renew": "bool", "notes": "str"}
-
+# The AMC / renewal / domain fields and their rules are defined once, in db.FIELDS / db.CHOICES.
 _sync_lock = threading.Lock()
-
-
-def _clean_section(sec: dict | None, allowed: dict) -> dict:
-    """Keep only known keys; coerce numbers/dates; blank -> absent."""
-    out = {}
-    for key, kind in allowed.items():
-        v = (sec or {}).get(key)
-        if v is None or (isinstance(v, str) and not v.strip()):
-            continue
-        if kind == "num":
-            try:
-                v = float(str(v).replace(",", ""))
-            except ValueError:
-                raise ValueError(f"'{key}' must be a number")
-        elif kind == "date":
-            v = str(v).strip()
-            if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
-                raise ValueError(f"'{key}' must be a date (YYYY-MM-DD)")
-        elif kind == "bool":
-            v = bool(v)
-        else:
-            v = str(v).strip()[:2000]
-        out[key] = v
-    return out
 
 
 class HttpError(Exception):
@@ -315,19 +279,7 @@ class Handler(SimpleHTTPRequestHandler):
         if m:
             user = self._require("editor")
             body = self._body()
-            amc = _clean_section(body.get("amc"), AMC_FIELDS)
-            ren = _clean_section(body.get("renewal"), RENEWAL_FIELDS)
-            dom = _clean_section(body.get("domain"), DOMAIN_FIELDS)
-            if amc.get("status", "") not in AMC_STATUSES:
-                raise ValueError("Unknown AMC status")
-            if amc.get("applies", "") not in AMC_APPLIES:
-                raise ValueError("Unknown AMC 'applies' value")
-            if dom.get("ownership", "") not in DOMAIN_OWNERS:
-                raise ValueError("Unknown domain ownership")
-            if ren.get("status", "") not in RENEWAL_STATUSES:
-                raise ValueError("Unknown renewal status")
-            entry = {"amc": amc, "renewal": ren, "domain": dom,
-                     "notes": str(body.get("notes") or "").strip()[:4000]}
+            entry = db.clean_entry(body)   # checks every field; a wrong value is refused with a message
             base = body["base_updated_at"] if "base_updated_at" in body else "any"
             saved = db.save_tracking(m.group(1), entry, user["username"], base)
             return self._json({"ok": True, "entry": saved})

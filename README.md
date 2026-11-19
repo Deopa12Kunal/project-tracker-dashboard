@@ -80,6 +80,9 @@ Everything lives in one SQLite database, `data/tracker.db`.
 | Change log | Every save in the dashboard, plus user-account changes | Recorded automatically: who, when, field, old → new value |
 | User accounts | *Users* tab or `manage.py` | Admins |
 
+- **AMC, renewal and domain fields each have their own column** in the `tracking` table (`amc_status`, `renewal_due_date`, `domain_expiry_date`, …), so they can be queried directly with SQL. The database itself refuses wrong values: unknown statuses, impossible dates, negative or non-numeric amounts. The fields are defined once, in `FIELDS` in `db.py`. To add one, add it there and add a matching `<section>.<field>` input in `static/index.html`. The column is created on the next start.
+- **Upgrading from an older version** (where these fields were stored as JSON) happens automatically on the first start. A backup, `tracker-before-columns-<date>.db`, is written next to the database first. If any stored value doesn't fit, nothing is changed and the server tells you which project and field to fix.
+
 - **Progress and status come from the CRM.** Update them in the CRM, then sync. The dashboard never writes back to the CRM. CRM syncs are listed under *Sync & settings*, with who started them.
 
 - **Sync.** "Sync from CRM" reads the month list from the CRM page and fetches every month. To sync only certain months, paste their links under *Sync & settings*, or run `python crm_sync.py 2025-09 2025-10`.
