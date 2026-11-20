@@ -5,8 +5,7 @@ Web server for the Project Status, AMC & Domain Tracking Dashboard.
     python server.py --port 9000
     python server.py --auto-sync-hours 6   # also re-sync from the CRM every 6 hours
 
-Everyone signs in with a login ID and password created by an admin.
-Create the first admin with:  python manage.py add-user admin --name "Your Name" --role admin
+Everyone signs in with ONE shared login ID and password, set in .env (LOGIN_ID / LOGIN_PASSWORD).
 Data is stored in SQLite (db.py). Settings come from .env (see .env.example).
 """
 from __future__ import annotations
@@ -194,9 +193,6 @@ class Handler(SimpleHTTPRequestHandler):
             q = self._query()
             limit = int(q.get("limit", 100)) if q.get("limit", "100").isdigit() else 100
             return self._json({"changes": db.changes(q.get("project") or None, limit)})
-        if r == "/api/users":
-            self._require("admin")
-            return self._json({"users": db.list_users()})
         raise HttpError(404, "Not found")
 
     # ---- POST ----
@@ -207,27 +203,6 @@ class Handler(SimpleHTTPRequestHandler):
             self._same_origin()
             db.delete_session(self._cookie(SESSION_COOKIE))
             return self._json({"ok": True}, cookies=[self._session_cookie("", 0)])
-        if r == "/api/me/password":
-            user = self._require()
-            body = self._body()
-            full = db.get_user(user["username"], with_hash=True)
-            if not auth.verify_password(str(body.get("current") or ""), full["password_hash"]):
-                raise HttpError(400, "Your current password is wrong")
-            new = auth.check_password(body.get("new"))
-            db.update_user(user["username"], user["username"], password_hash=auth.hash_password(new))
-            # Changing the password signs out every session, so start a fresh one here.
-            token = db.create_session(user["username"], config.SESSION_DAYS)
-            return self._json({"ok": True}, cookies=[self._session_cookie(token, config.SESSION_DAYS * 86400)])
-        if r == "/api/users":
-            admin = self._require("admin")
-            body = self._body()
-            name = str(body.get("name") or "").strip()[:100]
-            if not name:
-                raise ValueError("Enter the person's name")
-            u = db.create_user(auth.check_username(body.get("username")), name,
-                               auth.check_role(body.get("role")),
-                               auth.hash_password(auth.check_password(body.get("password"))), admin["username"])
-            return self._json({"ok": True, "user": u})
         m = re.fullmatch(r"/api/tracking/project/([A-Za-z0-9_-]{1,64})/informed", r)
         if m:
             user = self._require("editor")
@@ -260,8 +235,7 @@ class Handler(SimpleHTTPRequestHandler):
         password = str(body.get("password") or "")
         ip = self._client_ip()
         if auth.throttle.locked(username, ip):
-            raise HttpError(429, "Too many wrong attempts. Wait 15 minutes and try again, or ask an admin "
-                                 "to reset your password.")
+            raise HttpError(429, "Too many wrong attempts. Wait 15 minutes and try again.")
         account = db.get_user(username, with_hash=True) if username else None
         if not auth.authenticate(account, password):
             auth.throttle.fail(username, ip)
@@ -297,22 +271,6 @@ class Handler(SimpleHTTPRequestHandler):
             s["whatsapp_template"] = (str(body.get("whatsapp_template") or "").strip()[:2000]
                                       or db.DEFAULT_WHATSAPP_TEMPLATE)
             return self._json({"ok": True, "settings": db.save_settings(s, user["username"])})
-        m = re.fullmatch(r"/api/users/([a-z0-9._-]{1,32})", r)
-        if m:
-            admin = self._require("admin")
-            body = self._body()
-            kw = {}
-            if "name" in body:
-                kw["name"] = str(body["name"] or "").strip()[:100] or None
-            if "role" in body:
-                kw["role"] = auth.check_role(body["role"])
-            if "active" in body:
-                kw["active"] = bool(body["active"])
-            if body.get("password"):
-                kw["password_hash"] = auth.hash_password(auth.check_password(body["password"]))
-            if m.group(1) == admin["username"] and (kw.get("active") is False):
-                raise ValueError("You can't deactivate your own account")
-            return self._json({"ok": True, "user": db.update_user(m.group(1), admin["username"], **kw)})
         raise HttpError(404, "Not found")
 
 
@@ -329,6 +287,33 @@ def auto_sync_loop(hours: float):
                 _sync_lock.release()
 
 
+def setup_shared_login():
+    """Make the LOGIN_ID / LOGIN_PASSWORD from .env the one login everyone uses."""
+    try:
+        username = auth.check_username(config.LOGIN_ID)
+    except ValueError as e:
+        raise SystemExit(f"LOGIN_ID in .env is not valid. {e}")
+    password = config.LOGIN_PASSWORD
+    if len(password) < 6:
+        raise SystemExit("Set LOGIN_PASSWORD in the .env file (at least 6 characters), then start again.\n"
+                         "Example .env:\n  LOGIN_ID=admin\n  LOGIN_PASSWORD=choose-a-password")
+    account = db.get_user(username, with_hash=True)
+    same = account and auth.verify_password(password, account["password_hash"])
+    db.set_single_login(username, config.LOGIN_NAME, None if same else auth.hash_password(password))
+
+
+def _lan_addresses() -> list[str]:
+    import socket
+    ips = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))   # no packet is sent; just picks the network card in use
+            ips.add(s.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=config.HOST)
@@ -337,17 +322,19 @@ def main():
     args = ap.parse_args()
 
     db.init()
+    setup_shared_login()
     if db.project_count() == 0:
         print("No CRM data yet - running first sync...")
         crm_sync.sync()
     if args.auto_sync_hours > 0:
         threading.Thread(target=auto_sync_loop, args=(args.auto_sync_hours,), daemon=True).start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Dashboard: http://{args.host}:{args.port}")
-    print(f"Database:  {db.DB_PATH}")
-    if db.user_count(active_admins_only=True) == 0:
-        print("\n  No admin account yet. Create one (in another terminal):\n"
-              '    python manage.py add-user admin --name "Your Name" --role admin\n')
+    print(f"Dashboard (this PC):   http://127.0.0.1:{args.port}")
+    if args.host in ("0.0.0.0", ""):
+        for ip in _lan_addresses():
+            print(f"Dashboard (other PCs): http://{ip}:{args.port}")
+    print(f"Login ID: {config.LOGIN_ID}   (password is in the .env file)")
+    print(f"Database: {db.DB_PATH}")
     srv.serve_forever()
 
 

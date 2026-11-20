@@ -661,6 +661,34 @@ def update_user(username: str, by: str, *, name=None, role=None, active=None, pa
     return get_user(username)
 
 
+def set_single_login(username: str, name: str, password_hash: str | None) -> None:
+    """Make `username` the one active admin login and switch every other account off.
+    `password_hash` is None when the stored password already matches."""
+    at = now()
+    rows = []
+    with _db(write=True) as c:
+        old = c.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if not old:
+            c.execute("INSERT INTO users (username, name, role, password_hash, active, created_at, created_by, "
+                      "password_changed_at) VALUES (?, ?, 'admin', ?, 1, ?, 'system', ?)",
+                      (username, name, password_hash, at, at))
+            rows.append((f"user:{username}", None, f"Created: {name} (admin)"))
+        else:
+            c.execute("UPDATE users SET name = ?, role = 'admin', active = 1 WHERE username = ?", (name, username))
+            if password_hash:
+                c.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE username = ?",
+                          (password_hash, at, username))
+                c.execute("DELETE FROM sessions WHERE username = ?", (username,))
+                rows.append((f"user:{username}.password", None, "Password changed in .env"))
+        for (other,) in c.execute("SELECT username FROM users WHERE username != ? AND active = 1",
+                                  (username,)).fetchall():
+            c.execute("UPDATE users SET active = 0 WHERE username = ?", (other,))
+            rows.append((f"user:{other}.active", "Active", "Deactivated"))
+        c.execute("DELETE FROM sessions WHERE username != ?", (username,))
+        if rows:
+            _log(c, at, "system", None, rows)
+
+
 def touch_login(username: str) -> None:
     with _db(write=True) as c:
         c.execute("UPDATE users SET last_login = ? WHERE username = ?", (now(), username))

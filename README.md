@@ -7,28 +7,29 @@ Needs only Python 3.10 or newer. No packages to install.
 ## Run on your own computer
 
 ```
-python manage.py add-user admin --name "Your Name" --role admin   # once: create the first admin
+copy .env.example .env      # once: then set LOGIN_ID and LOGIN_PASSWORD in .env
 python server.py                                                   # http://127.0.0.1:8765
 python server.py --auto-sync-hours 6   # also re-sync from the CRM every 6 hours
 ```
 
 On Windows you can also double-click `start.bat`. It opens the browser and auto-syncs every 6 hours.
 
-## Logins
+When the server starts it prints the address for other PCs on the same network, e.g. `http://192.168.29.116:8765`. The PC running the server must stay on. Set `HOST=127.0.0.1` in `.env` to allow this PC only.
 
-Everyone signs in with a **login ID and password created by an admin**. There is no public sign-up.
+## Login
 
-| Role | Can do |
-|---|---|
-| Admin | Everything an editor can, plus add users, reset passwords, change roles and deactivate accounts (*Users* tab) |
-| Editor | Update AMC, renewal and domain records, send WhatsApp reminders, sync from the CRM, change the rules |
-| Viewer | Look only |
+There is **one shared login** for everyone, set in `.env`:
 
-- **Create the first admin** on the server with `python manage.py add-user <login-id> --name "Full Name" --role admin`. After that, admins add everyone else in the *Users* tab.
-- **Forgotten password:** an admin resets it in the *Users* tab, or on the server with `python manage.py reset-password <login-id>`.
-- **Change your own password:** click your name at the top right.
-- **Security:** passwords are stored only as salted PBKDF2 hashes, never in plain text. After 5 wrong passwords, that login ID is locked for 15 minutes. A deactivated account is signed out at once and can't sign in.
-- `python manage.py list-users` shows all accounts.
+```
+LOGIN_ID=admin
+LOGIN_PASSWORD=your-password      # at least 6 characters
+LOGIN_NAME=Admin                  # name shown in the Activity log
+```
+
+- **Change the password:** edit `LOGIN_PASSWORD` in `.env` and restart the server. Everyone is signed out and signs in with the new password.
+- The shared login has full access (edit records, sync, settings). Any other accounts from earlier versions are switched off when the server starts.
+- Because everyone uses the same login, the Activity log shows changes as made by `LOGIN_NAME`, not by a named person.
+- **Security:** the password is kept in the database only as a salted PBKDF2 hash. After 5 wrong passwords from the same PC, that PC is locked out for 15 minutes.
 
 ## WhatsApp AMC reminders
 
@@ -54,10 +55,9 @@ The app runs as a small Python service behind nginx (HTTPS). The steps below ass
 
 **1. Copy the app to the server**, for example to `/opt/project-tracker`, owned by a `tracker` user. Copy `data/tracker.db` along with it, so the existing data and user accounts come too. If you leave it out, the first start imports from `data/crm_store.json` and `data/tracking.json` if they're present, or else syncs from the CRM.
 
-**2. Configure it:** `cp .env.example .env`, then set `PUBLIC_URL` to the HTTPS address.
+**2. Configure it:** `cp .env.example .env`, then set `LOGIN_ID`, `LOGIN_PASSWORD`, `HOST=127.0.0.1` (nginx sits in front) and `PUBLIC_URL` to the HTTPS address.
 
-**3. Create the first admin** (skip this if you copied `tracker.db`, which already has your accounts):
-`sudo -u tracker python3 manage.py add-user admin --name "Your Name" --role admin`
+**3.** (No account setup needed: the shared login comes from `.env`.)
 
 **4. Run it as a service:** see `deploy/project-tracker.service`.
 

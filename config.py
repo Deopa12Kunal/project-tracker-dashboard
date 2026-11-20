@@ -23,7 +23,13 @@ def _load_env_file(path: str) -> None:
 
 _load_env_file(os.path.join(ROOT, ".env"))
 
-HOST = os.environ.get("HOST", "127.0.0.1")
+# 0.0.0.0 = other PCs on the network can open the dashboard. Use 127.0.0.1 for this PC only.
+HOST = os.environ.get("HOST", "0.0.0.0")
+
+# The one shared login everyone uses. Change it here (in .env) and restart the server.
+LOGIN_ID = os.environ.get("LOGIN_ID", "admin").strip().lower()
+LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "")
+LOGIN_NAME = os.environ.get("LOGIN_NAME", "Admin").strip() or "Admin"
 PORT = int(os.environ.get("PORT", "8765"))
 AUTO_SYNC_HOURS = float(os.environ.get("AUTO_SYNC_HOURS", "0"))
 

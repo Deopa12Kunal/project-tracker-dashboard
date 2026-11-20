@@ -574,52 +574,14 @@ function renderUser() {
   const chip = $("#userChip");
   chip.hidden = false;
   chip.textContent = u.name + (u.role === "viewer" ? " · view only" : "") + " ▾";
-  chip.title = `Signed in as ${u.username} (${ROLE_LABEL[u.role]}). Click to change your password or sign out.`;
-  $("#usersTabBtn").hidden = !isAdmin();
-  if (state.tab === "users" && !isAdmin()) state.tab = "projects";
+  chip.title = `Signed in as ${u.username}. Click to sign out.`;
+  if (state.tab === "users") state.tab = "projects";   // the Users tab was removed (one shared login)
   const ro = !canEdit();
   $("#syncBtn").hidden = ro;
   $("#readonlyNote").hidden = !ro;
   $$("#trackForm fieldset, #trackForm button, #settingsForm button, #syncForm button, #syncForm textarea").forEach((el) => (el.disabled = ro));
 }
 
-/* ----------------------------------------------------------------- users */
-async function loadUsers() {
-  try { state.users = (await api("/api/users")).users; } catch (err) { state.users = []; toast(err.message, true); }
-}
-function renderUsers() {
-  if (!state.users) { state.users = []; loadUsers().then(() => state.tab === "users" && render()); }
-  const me = state.user.username;
-  renderTable($("#usersTable"), "users", [
-    { key: "name", label: "Name", render: (u) => `<span class="name">${esc(u.name)}</span><span class="meta">${esc(u.username)}</span>` },
-    { key: "role", label: "Role", render: (u) => `<select data-role="${esc(u.username)}" ${u.username === me ? "disabled title=\"Ask another admin to change your role\"" : ""}>${Object.entries(ROLE_LABEL).map(([k, l]) => `<option value="${k}" ${u.role === k ? "selected" : ""}>${l}</option>`).join("")}</select>` },
-    { key: "active", label: "Access", render: (u) => u.active ? statusPill("good", "✓", "Active") : statusPill("critical", "✕", "Deactivated") },
-    { key: "last_login", label: "Last sign-in", render: (u) => esc(u.last_login ? new Date(u.last_login).toLocaleString() : "Never") },
-    { key: "actions", label: "", render: (u) => `<button class="btn small" data-reset="${esc(u.username)}">Reset password</button> ` +
-      (u.username === me ? "" : `<button class="btn small" data-active="${esc(u.username)}" data-to="${u.active ? 0 : 1}">${u.active ? "Deactivate" : "Reactivate"}</button>`) },
-  ], (state.users || []).map((u) => ({ ...u, id: "" })), "No users yet.");
-  $$("#usersTable tbody tr").forEach((tr) => tr.onclick = null);
-  const update = async (username, body, done) => {
-    try { await api(`/api/users/${encodeURIComponent(username)}`, { method: "PUT", body: JSON.stringify(body) }); toast(done); }
-    catch (err) { toast(err.message, true); }
-    await Promise.all([loadUsers(), loadChanges()]); render();
-  };
-  $$("#usersTable [data-role]").forEach((s) => s.onchange = () => update(s.dataset.role, { role: s.value }, `Role changed to ${ROLE_LABEL[s.value]}.`));
-  $$("#usersTable [data-active]").forEach((b) => b.onclick = () => {
-    const on = b.dataset.to === "1";
-    if (!on && !confirm(`Deactivate ${b.dataset.active}? They'll be signed out and can't sign in until reactivated. Their past changes stay in the log.`)) return;
-    update(b.dataset.active, { active: on }, on ? "Account reactivated." : "Account deactivated.");
-  });
-  $$("#usersTable [data-reset]").forEach((b) => b.onclick = () => {
-    const pw = prompt(`New password for ${b.dataset.reset} (min 8 characters). They'll be signed out and need to use this password.`, randomPassword());
-    if (pw) update(b.dataset.reset, { password: pw }, `Password reset. Share it with ${b.dataset.reset} privately.`);
-  });
-}
-function randomPassword() {
-  const chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const a = crypto.getRandomValues(new Uint32Array(12));
-  return [...a].map((n) => chars[n % chars.length]).join("");
-}
 
 function renderSettings() {
   const s = state.tracking.settings;
@@ -666,7 +628,6 @@ function render() {
   if (state.tab === "activity") renderActivity();
   if (state.tab === "quality") renderQuality(rows);
   if (state.tab === "settings") renderSettings();
-  if (state.tab === "users") renderUsers();
   try { localStorage.setItem("ptd.view", JSON.stringify({ f: state.f, tab: state.tab })); } catch {}
 }
 
@@ -796,28 +757,10 @@ function wire() {
   $("#userChip").onclick = () => {
     const u = state.user;
     $("#accountTitle").textContent = u.name;
-    $("#accountInfo").textContent = `Login ID: ${u.username} · Role: ${ROLE_LABEL[u.role]}`;
-    $("#passwordForm").reset(); $("#accountDialog").showModal();
+    $("#accountInfo").textContent = `Login ID: ${u.username}`;
+    $("#accountDialog").showModal();
   };
   $("#accountClose").onclick = () => $("#accountDialog").close();
-  $("#passwordForm").onsubmit = async (e) => {
-    e.preventDefault(); const f = e.target;
-    if (f.new.value !== f.repeat.value) return toast("The new passwords don't match.", true);
-    try {
-      await api("/api/me/password", { method: "POST", body: JSON.stringify({ current: f.current.value, new: f.new.value }) });
-      $("#accountDialog").close(); toast("Password changed. You've been signed out on other devices.");
-    } catch (err) { toast(err.message, true); }
-  };
-  $("#genPassword").onclick = () => { $("#userForm").password.value = randomPassword(); };
-  $("#userForm").onsubmit = async (e) => {
-    e.preventDefault(); const f = e.target;
-    const body = { name: f.name.value, username: f.username.value.trim().toLowerCase(), role: f.role.value, password: f.password.value };
-    try {
-      await api("/api/users", { method: "POST", body: JSON.stringify(body) });
-      toast(`Created ${body.username}. Share the login ID and password with them privately.`);
-      f.reset(); await Promise.all([loadUsers(), loadChanges()]); render();
-    } catch (err) { toast(err.message, true); }
-  };
   // See colleagues' changes without reloading: check every 30 s for anything new.
   setInterval(async () => {
     if (document.hidden || !state.version) return;

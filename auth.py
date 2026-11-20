@@ -19,8 +19,9 @@ ROLES = ("admin", "editor", "viewer")
 ROLE_LEVEL = {"viewer": 0, "editor": 1, "admin": 2}
 MIN_PASSWORD = 8
 
-MAX_FAILS_PER_USER = 5
-MAX_FAILS_PER_IP = 20
+# Everyone shares one login, so lock mainly per PC: one person's typos shouldn't lock out the whole team.
+MAX_FAILS_PER_USER = 30
+MAX_FAILS_PER_IP = 5
 LOCK_SECONDS = 15 * 60
 
 

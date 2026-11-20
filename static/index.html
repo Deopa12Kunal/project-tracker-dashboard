@@ -51,7 +51,6 @@
     <button role="tab" data-tab="activity">Activity</button>
     <button role="tab" data-tab="quality">Data quality</button>
     <button role="tab" data-tab="settings">Sync &amp; settings</button>
-    <button role="tab" data-tab="users" id="usersTabBtn" hidden>Users</button>
   </nav>
 
   <section class="panel tabpanel" id="tab-projects">
@@ -137,30 +136,6 @@
     <div class="table-wrap"><table id="syncLogTable"></table></div>
   </section>
 
-  <section class="panel tabpanel" id="tab-users" hidden>
-    <div class="settings-grid">
-      <form id="userForm" class="card-form">
-        <h3>Add a user</h3>
-        <p class="note">Create a login for a colleague, then share the login ID and password with them privately. They can change the password after signing in.</p>
-        <label>Full name <input name="name" required maxlength="100"></label>
-        <label>Login ID <input name="username" required pattern="[a-z0-9][a-z0-9._\-]{2,31}" autocapitalize="none" spellcheck="false" placeholder="e.g. priya"></label>
-        <label>Role
-          <select name="role">
-            <option value="editor">Editor: can update AMC, renewal and domain records</option>
-            <option value="viewer">Viewer: can only look</option>
-            <option value="admin">Admin: editor + can manage users</option>
-          </select>
-        </label>
-        <label>Password (min 8 characters) <input name="password" type="text" required minlength="8" autocomplete="new-password"></label>
-        <button class="btn ghost small" type="button" id="genPassword">Generate a password</button>
-        <button class="btn primary" type="submit">Create user</button>
-      </form>
-      <div>
-        <h3 style="margin-top:0">Users</h3>
-        <div class="table-wrap"><table id="usersTable"></table></div>
-      </div>
-    </div>
-  </section>
 </main>
 
 <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
@@ -272,18 +247,14 @@
 </dialog>
 
 <dialog id="accountDialog" class="dialog">
-  <form id="passwordForm">
+  <form id="accountForm" method="dialog">
     <h2 id="accountTitle">Your account</h2>
     <p class="note" id="accountInfo"></p>
-    <h3>Change password</h3>
-    <label>Current password <input type="password" name="current" required autocomplete="current-password"></label>
-    <label>New password (min 8 characters) <input type="password" name="new" required minlength="8" autocomplete="new-password"></label>
-    <label>Repeat new password <input type="password" name="repeat" required minlength="8" autocomplete="new-password"></label>
+    <p class="note">Everyone uses this one shared login. To change the password, edit <code>LOGIN_PASSWORD</code> in the <code>.env</code> file on the PC that runs the server, then restart it. Everyone will need to sign in again.</p>
     <div class="dialog-actions">
       <button class="btn ghost" type="button" id="logoutBtn">Sign out</button>
       <span style="flex:1"></span>
       <button class="btn" type="button" id="accountClose">Close</button>
-      <button class="btn primary" type="submit">Change password</button>
     </div>
   </form>
 </dialog>
