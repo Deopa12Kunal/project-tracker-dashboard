@@ -4,7 +4,6 @@
 !.env.example
 
 # Data: the database holds client and payment details. Back it up, don't commit it.
-data/
 backups/
 *.db
 *.db-wal

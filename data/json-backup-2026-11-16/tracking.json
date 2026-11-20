@@ -1,0 +1,13 @@
+{
+ "settings": {
+  "domain_warning_days": 30,
+  "delayed_statuses": [
+   "On Hold",
+   "Disputed",
+   "Not Responding"
+  ],
+  "no_deadline_grace_days": 30,
+  "currency": "₹"
+ },
+ "projects": {}
+}
