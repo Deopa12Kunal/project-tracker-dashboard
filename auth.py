@@ -13,6 +13,7 @@ import secrets
 import threading
 import time
 
+
 ITERATIONS = 600_000
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
 ROLES = ("admin", "editor", "viewer")
